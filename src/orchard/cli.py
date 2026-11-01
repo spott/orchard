@@ -85,9 +85,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.add_argument("--version", action="version", version=f"orchard {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="VERB")
+    # `dev ls --json` must work as well as `dev --json ls`; SUPPRESS keeps the
+    # subparser from overriding the top-level value when the flag is absent.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     def add(name: str, fn: Any, help: str) -> argparse.ArgumentParser:
-        sp = sub.add_parser(name, help=help)
+        sp = sub.add_parser(name, help=help, parents=[common])
         sp.set_defaults(fn=fn)
         return sp
 

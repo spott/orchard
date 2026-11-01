@@ -27,6 +27,10 @@ def test_create_ls_status_json(run):
     assert code == 0 and json.loads(out)["name"] == "foo"
     code, out, _ = run("--json", "ls")
     assert [w["name"] for w in json.loads(out)] == ["foo"]
+    code, out, _ = run("ls", "--json")
+    assert code == 0 and [w["name"] for w in json.loads(out)] == ["foo"]
+    code, out, _ = run("ls")
+    assert code == 0 and out.startswith("NAME") and "foo" in out
     code, out, _ = run("status", "foo")
     assert code == 0 and out.startswith("foo")
 

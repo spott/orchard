@@ -231,7 +231,15 @@ class Manager:
             self.inc.volume_create(
                 cfg.pool, vol,
                 size=cfg.volume_size,
-                **{"initial.uid": str(cfg.uid), "initial.gid": str(cfg.gid), "initial.mode": "0755"},
+                # security.shifted: idmapped mount, so host uid 1000 on the volume is
+                # uid 1000 inside the unprivileged container (shift= is not allowed on
+                # custom-volume disk devices).
+                **{
+                    "initial.uid": str(cfg.uid),
+                    "initial.gid": str(cfg.gid),
+                    "initial.mode": "0755",
+                    "security.shifted": "true",
+                },
             )
             made_volume = True
         else:
@@ -247,7 +255,7 @@ class Manager:
         self.log(f"creating {name} from image {image}")
         try:
             self.inc.init(image, name, cfg.profiles, meta)
-            self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path(), shift="true")
+            self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
             self.inc.start(name)
             ws = self._wait_ready(name)
         except OrchardError:

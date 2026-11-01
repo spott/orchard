@@ -14,13 +14,16 @@ def test_create_makes_volume_instance_device_and_starts(mgr, inc):
     assert ops == ["volume_create", "init", "device_add", "start"]
     _, pool, vol, vcfg = inc.calls[0]
     assert (pool, vol) == ("default", "ws-foo")
-    assert vcfg == {"size": "50GiB", "initial.uid": "1000", "initial.gid": "100", "initial.mode": "0755"}
+    assert vcfg == {
+        "size": "50GiB", "initial.uid": "1000", "initial.gid": "100", "initial.mode": "0755",
+        "security.shifted": "true",
+    }
     _, image, name, profiles, meta = inc.calls[1]
     assert (image, name, profiles) == ("workspace", "foo", ("default",))
     assert meta[KEY + "managed"] == "true"
     dev = inc.calls[2]
     assert dev[2:4] == ("work", "disk")
-    assert dev[4] == {"pool": "default", "source": "ws-foo", "path": "/home/spott/work", "shift": "true"}
+    assert dev[4] == {"pool": "default", "source": "ws-foo", "path": "/home/spott/work"}
 
 
 def test_create_is_idempotent_and_starts_stopped(mgr, inc):
