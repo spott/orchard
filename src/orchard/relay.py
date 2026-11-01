@@ -14,9 +14,15 @@ CHUNK = 65536
 def relay(sock: socket.socket, stdin_fd: int = 0, stdout_fd: int = 1) -> None:
     sock.setblocking(True)
     sel = selectors.DefaultSelector()
-    sel.register(stdin_fd, selectors.EVENT_READ, "in")
     sel.register(sock, selectors.EVENT_READ, "sock")
     stdin_open = True
+    try:
+        sel.register(stdin_fd, selectors.EVENT_READ, "in")
+    except (PermissionError, OSError):
+        # stdin is not pollable (/dev/null, a regular file): nothing will
+        # ever arrive from the client, so half-close and just drain sshd.
+        stdin_open = False
+        sock.shutdown(socket.SHUT_WR)
     try:
         while True:
             for key, _ in sel.select():

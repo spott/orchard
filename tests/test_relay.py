@@ -52,3 +52,19 @@ def test_relay_large_payload():
     t.join(timeout=5)
     for fd in (in_r, out_r, out_w):
         os.close(fd)
+
+
+def test_relay_with_unpollable_stdin_still_drains_socket():
+    client, server = socket.socketpair()
+    out_r, out_w = os.pipe()
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    t = threading.Thread(target=relay, args=(client, devnull, out_w))
+    t.start()
+    assert server.recv(10) == b""  # half-closed from our side immediately
+    server.sendall(b"banner")
+    assert os.read(out_r, 100) == b"banner"
+    server.close()
+    t.join(timeout=5)
+    assert not t.is_alive()
+    for fd in (devnull, out_r, out_w):
+        os.close(fd)
