@@ -27,7 +27,11 @@ class Incus:
 
     def run(self, *args: str, input: str | None = None, check: bool = True) -> subprocess.CompletedProcess[str]:
         argv = [self.binary, *args]
-        proc = subprocess.run(argv, capture_output=True, text=True, input=input)
+        # Never inherit stdin: several incus subcommands (init, storage volume
+        # create, ...) read a YAML config from stdin when it is not a terminal
+        # and block until EOF. In the front door stdin is the ssh transport.
+        stdin = None if input is not None else subprocess.DEVNULL
+        proc = subprocess.run(argv, capture_output=True, text=True, input=input, stdin=stdin)
         if check and proc.returncode != 0:
             raise IncusError(argv, proc.returncode, proc.stderr)
         return proc
