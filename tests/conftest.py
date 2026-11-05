@@ -22,6 +22,8 @@ class FakeIncus(Incus):
         self.calls: list[tuple[Any, ...]] = []
         self.fail_on: set[str] = set()
         self.next_ip = 10
+        self.journal: dict[str, str] = {}
+        self.files: dict[str, dict[str, str]] = {}
 
     def _maybe_fail(self, op: str) -> None:
         if op in self.fail_on:
@@ -53,10 +55,13 @@ class FakeIncus(Incus):
         self.calls.append(("start", name))
         i = self.inst[name]
         i["status"] = "Running"
-        self.next_ip += 1
+        reserved = (i["devices"].get("eth0") or {}).get("ipv4.address")
+        if reserved is None:
+            self.next_ip += 1
+            reserved = f"10.100.0.{self.next_ip}"
         i["state"] = {"network": {"eth0": {"addresses": [
             {"family": "inet6", "scope": "link", "address": "fe80::1"},
-            {"family": "inet", "scope": "global", "address": f"10.100.0.{self.next_ip}"},
+            {"family": "inet", "scope": "global", "address": reserved},
         ]}}}
 
     def stop(self, name, force=False):
@@ -81,6 +86,33 @@ class FakeIncus(Incus):
         self._maybe_fail("device_add")
         self.calls.append(("device_add", name, device, kind, dict(props)))
         self.inst[name]["devices"][device] = {"type": kind, **props}
+
+    def device_override(self, name, device, **props):
+        self._maybe_fail("device_override")
+        self.calls.append(("device_override", name, device, dict(props)))
+        dev = self.inst[name]["devices"].setdefault(device, {"type": "nic", "network": "incusbr0"})
+        dev.update(props)
+        # Like Incus: a reserved address is what the next start leases.
+        if device == "eth0" and props.get("ipv4.address") and self.inst[name]["status"] == "Running":
+            self.inst[name]["state"]["network"]["eth0"]["addresses"] = [
+                {"family": "inet", "scope": "global", "address": props["ipv4.address"]}
+            ]
+
+    def device_set(self, name, device, **props):
+        self.calls.append(("device_set", name, device, dict(props)))
+        self.inst[name]["devices"][device].update(props)
+
+    def exec(self, name, *cmd, check=True):
+        import subprocess
+        self.calls.append(("exec", name, cmd))
+        out = self.journal.get(name, "") if cmd and cmd[0] == "journalctl" else ""
+        return subprocess.CompletedProcess([self.binary, "exec", name, *cmd], 0, out, "")
+
+    def file_push(self, src, name, dst, *, uid=None, gid=None, mode=None):
+        with open(src) as f:
+            content = f.read()
+        self.calls.append(("file_push", name, dst, uid, gid, mode))
+        self.files.setdefault(name, {})[dst] = content
 
     # volumes
     def volumes(self, pool):

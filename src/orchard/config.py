@@ -38,6 +38,30 @@ class Config:
     lock_dir: str = "/run/orchard"
     # event name -> executable path; see README "Hooks".
     hooks: dict[str, str] = field(default_factory=dict)
+    # Static addresses: every workspace gets a DHCP reservation from this
+    # inclusive range (its `ipv4.address` on eth0), so its name has an answer
+    # while it is stopped. Empty = dynamic leases only.
+    address_start: str = ""
+    address_end: str = ""
+    # Self-service from inside a workspace (`dev rename|rm|stop` in the
+    # container): the host address the container's `dev` client sshes to
+    # (the Incus bridge), and the host key it pins. Empty = not installed.
+    self_host: str = ""
+    self_hostkey_file: str = "/etc/ssh/ssh_host_ed25519_key.pub"
+    ssh_keygen: str = "ssh-keygen"
+    # The wake resolver (`orchard-dns`): a lookup of `<name>.<zone>` starts
+    # a stopped workspace, or creates a missing one when dns_create is set.
+    dns_listen: str = ""
+    dns_port: int = 53
+    dns_zone: str = ""
+    dns_reverse_zone: str = ""
+    dns_upstream: str = ""
+    dns_upstream_port: int = 53
+    dns_ttl: int = 5
+    dns_create: bool = True
+    # `gc` also removes workspaces that a lookup created (origin "dns") and
+    # that nobody has logged into after this many hours: typos.
+    untouched_hours: int = 24
 
     @classmethod
     def load(cls, path: str | None = None) -> "Config":
