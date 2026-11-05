@@ -16,9 +16,11 @@ Orchard is a small Python package (standard library only) plus a NixOS module:
 
 | Piece | What |
 |---|---|
-| `dev` | the operator CLI: `create`, `ls`, `status`, `start`, `stop`, `restart`, `rm`, `gc`, `proxy` |
+| `dev` | the operator CLI: `create`, `ls`, `status`, `start`, `stop`, `restart`, `rename`, `rm`, `gc`, `proxy` |
 | `orchard-front-door` | the sshd `ForceCommand` for the jump user; speaks `proxy <host>` and `dev <args>` |
-| `services.orchard` | NixOS module: jump user, sshd `Match` block, config file, daily `gc` timer |
+| `orchard-dns` | the wake resolver: serves the workspace zone, starts or creates what is looked up |
+| `orchard-authorized-keys` | sshd `AuthorizedKeysCommand`: the workspaces' self-service keys |
+| `services.orchard` | NixOS module: jump user, sshd `Match` block, config file, resolver service, daily `gc` timer |
 
 ## How it works
 
@@ -52,6 +54,60 @@ Orchard does not build images. Any Incus image works that:
 
 The reference image is a NixOS container built in
 [spott/iac](https://github.com/spott/iac) (`orchard/image/`).
+
+## Wake on lookup (no jump host)
+
+When the workspaces are real hosts on the LAN (their Incus bridge is on a
+VLAN, no NAT) the front door is optional: `services.orchard.wake` runs a
+small resolver that the site's DNS forwards the workspace zone to. A lookup
+of `foo.orchard.example.com` answers with `foo`'s address and, in the
+background, starts `foo` if it is stopped or creates it if it does not
+exist. The client's first SYN goes unanswered; the retransmit a second or
+two later reaches the container's sshd (create takes a few seconds). So from
+anything that can only do plain ssh or mosh, such as Blink on iOS:
+
+```
+mosh spott@foo.orchard.example.com      # creates foo if needed, then connects
+```
+
+What makes it work: ssh sends no host name, so the name must be recoverable
+from the address. Every workspace therefore gets a DHCP reservation from
+`services.orchard.addresses` (its eth0 `ipv4.address`; Incus's dnsmasq hands
+it out), and the resolver answers it even while the workspace is stopped,
+which dnsmasq alone would not. Everything that is not a workspace name
+(the zone apex, `_gateway`, reverse entries dnsmasq knows) is forwarded to
+dnsmasq. Answers for a known name that have no data (AAAA, ...) are empty
+NOERROR, never NXDOMAIN, so a caching resolver cannot poison the A record.
+
+The price of creating on lookup is that a typo creates a workspace. `dev gc`
+(daily) removes a lookup-created workspace that nobody has ever logged into
+after `untouchedHours` (24), volume to trash as usual. Set
+`wake.createOnLookup = false` to answer NXDOMAIN for unknown names instead;
+then `dev create` (from anywhere: `ssh dev@orchard.example.com dev create
+foo`) stays the one explicit step.
+
+## Self-service from inside a workspace
+
+With `services.orchard.self.enable`, `dev` installs into every workspace a
+key pair (`~/.orchard/self.key`, public half on the instance's
+`user.orchard.selfkey`), the host's pinned key, and a `dev` client in
+`~/.local/bin`. The host's sshd accepts those keys for the jump user
+(`AuthorizedKeysCommand`) and the front door, told by `ExposeAuthInfo` which
+key authenticated, lets such a session act on its own workspace only:
+
+```
+dev status            # this workspace
+dev rename bar        # stop, rename instance and volume, start again; reconnect as bar
+dev stop
+dev rm                # volume kept for the grace period as trash-<name>-<stamp>
+dev ls                # read-only view of the others
+```
+
+`rename`, `stop` and `rm` end the session they were typed in (the container
+stops), so the host runs them detached after acknowledging on stderr. The
+client talks to `self.host` (the Incus bridge address), which the containers
+reach without crossing the site firewall. A workspace from before this
+existed gets its key the next time `dev` starts it.
 
 ## Client setup
 
@@ -123,7 +179,7 @@ Incus. The relay has its own socketpair tests.
 ## Roadmap
 
 - `fork`, `rebase` (image upgrade preserving the volume and ssh identity),
-  `update` — v0.2
+  `update`
 - nightly `incus storage volume export` backups with a restore test
 - an MCP server over the same library
 

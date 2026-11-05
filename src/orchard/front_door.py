@@ -3,7 +3,9 @@
     proxy <host>   create/start workspace <host minus suffix>, then relay to its sshd
     dev <args...>  run the CLI (for `ssh dev@orchard dev ls --json`)
 
-Nothing but the ssh transport ever goes to stdout."""
+When the key that authenticated is a workspace's self-service key (sshd's
+ExposeAuthInfo tells us which key it was), only `dev` runs, and only on that
+workspace. Nothing but the ssh transport ever goes to stdout."""
 
 from __future__ import annotations
 
@@ -39,9 +41,40 @@ def proxy(host: str, cfg: Config | None = None) -> int:
     return 0
 
 
+def self_workspace(auth_file: str | None = None, mgr: Manager | None = None) -> str | None:
+    """The workspace whose self-service key authenticated this session, from
+    the file sshd writes when ExposeAuthInfo is on (`publickey <type> <b64>`
+    lines); None for an operator's key or when the file is absent."""
+    path = auth_file or os.environ.get("SSH_USER_AUTH")
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            lines = f.read().splitlines()
+    except OSError:
+        return None
+    keys = [" ".join(p[1:3]) for p in (line.split() for line in lines) if len(p) >= 3 and p[0] == "publickey"]
+    if not keys:
+        return None
+    if mgr is None:
+        cfg = Config.load()
+        mgr = Manager(cfg, Incus(cfg.incus))
+    for key in keys:
+        ws = mgr.find_by_selfkey(key)
+        if ws is not None:
+            return ws.name
+    return None
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parse(os.environ.get("SSH_ORIGINAL_COMMAND", "")) if argv is None else argv
     try:
+        self_name = self_workspace()
+        if self_name is not None:
+            if args and args[0] == "dev":
+                return cli.main(args[1:], self_name=self_name)
+            print(f"usage (from inside workspace {self_name}): dev <args...>", file=sys.stderr)
+            return 2
         if len(args) == 2 and args[0] == "proxy":
             return proxy(args[1])
         if args and args[0] == "dev":

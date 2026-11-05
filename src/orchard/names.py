@@ -39,6 +39,20 @@ def from_host(host: str, suffixes: list[str]) -> str:
     return validate(host)
 
 
+def label(qname: str, zone: str) -> str | None:
+    """`foo.orchard.example.com` under zone `orchard.example.com` -> `foo`;
+    None for the apex, deeper names, or anything that is not a valid
+    workspace name (so `_gateway` and friends are someone else's)."""
+    qname = qname.lower().rstrip(".")
+    zone = zone.lower().rstrip(".")
+    if not zone or not qname.endswith("." + zone):
+        return None
+    head = qname[: -len(zone) - 1]
+    if "." in head or not NAME_RE.match(head):
+        return None
+    return head
+
+
 def volume(name: str) -> str:
     return VOLUME_PREFIX + name
 

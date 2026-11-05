@@ -76,14 +76,30 @@ class Incus:
     def device_add(self, name: str, device: str, kind: str, **props: str) -> None:
         self.run("config", "device", "add", name, device, kind, *[f"{k}={v}" for k, v in props.items()])
 
+    def device_override(self, name: str, device: str, **props: str) -> None:
+        """Copy a profile device onto the instance with these properties
+        changed (works on a running instance; for `eth0 ipv4.address` Incus
+        writes the DHCP reservation at once)."""
+        self.run("config", "device", "override", name, device, *[f"{k}={v}" for k, v in props.items()])
+
+    def device_set(self, name: str, device: str, **props: str) -> None:
+        self.run("config", "device", "set", name, device, *[f"{k}={v}" for k, v in props.items()])
+
     def exec(self, name: str, *cmd: str, check: bool = True) -> subprocess.CompletedProcess[str]:
         return self.run("exec", name, "--", *cmd, check=check)
 
     def file_pull(self, name: str, src: str, dst: str) -> None:
         self.run("file", "pull", f"{name}{src}", dst)
 
-    def file_push(self, src: str, name: str, dst: str) -> None:
-        self.run("file", "push", src, f"{name}{dst}")
+    def file_push(self, src: str, name: str, dst: str, *, uid: int | None = None, gid: int | None = None, mode: str | None = None) -> None:
+        args = ["file", "push", "--create-dirs"]
+        if uid is not None:
+            args += ["--uid", str(uid)]
+        if gid is not None:
+            args += ["--gid", str(gid)]
+        if mode is not None:
+            args += ["--mode", mode]
+        self.run(*args, src, f"{name}{dst}")
 
     # -- custom storage volumes ---------------------------------------------
 

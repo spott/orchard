@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import signal
 import sys
+import syslog
 from typing import Any
 
 from . import OrchardError, __version__
@@ -61,6 +64,12 @@ def cmd_restart(mgr: Manager, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_rename(mgr: Manager, args: argparse.Namespace) -> int:
+    ws = mgr.rename(args.old, args.new)
+    _emit(args, ws.as_dict(), f"{ws.name} {ws.status} {ws.ip or '-'}")
+    return 0
+
+
 def cmd_rm(mgr: Manager, args: argparse.Namespace) -> int:
     removed = mgr.rm(args.name, now=args.now, tree=args.tree)
     _emit(args, {"removed": removed}, "\n".join(f"removed {n}" for n in removed) or f"no workspace named {args.name!r}")
@@ -107,6 +116,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("name")
     s.add_argument("--force", action="store_true")
     add("restart", cmd_restart, "stop then start").add_argument("name")
+    n = add("rename", cmd_rename, "rename a workspace (stops and restarts a running one)")
+    n.add_argument("old")
+    n.add_argument("new")
     r = add("rm", cmd_rm, "delete a workspace; its volume is kept for the grace period")
     r.add_argument("name")
     r.add_argument("--now", action="store_true", help="delete the volume immediately")
@@ -117,15 +129,86 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
-def main(argv: list[str] | None = None) -> int:
+# What a workspace may do to itself through its self-service key.
+SELF_VERBS = {"ls", "status", "stop", "rename", "rm"}
+# ...and which of those end its own ssh session, so they run detached.
+SELF_DETACHED = {"stop", "rename", "rm"}
+
+
+class SelfRefused(OrchardError):
+    pass
+
+
+def self_argv(argv: list[str], self_name: str) -> list[str]:
+    """Rewrite a command typed inside workspace `self_name` so it can only
+    act on that workspace: the name argument is implied (`dev rename bar`,
+    `dev rm`) and, if given, must be its own."""
+    flags = [a for a in argv if a.startswith("-")]
+    words = [a for a in argv if not a.startswith("-")]
+    if not words:
+        return argv
+    verb, rest = words[0], words[1:]
+    if verb not in SELF_VERBS:
+        raise SelfRefused(f"{verb!r} is not available from inside a workspace (only: {', '.join(sorted(SELF_VERBS))})")
+    if verb == "ls":
+        return [verb, *flags]
+    if verb == "rename":
+        if len(rest) == 1:
+            rest = [self_name, rest[0]]
+        elif len(rest) == 2 and rest[0] != self_name:
+            raise SelfRefused(f"a workspace may only rename itself ({self_name})")
+    else:
+        if not rest:
+            rest = [self_name]
+        elif rest[0] != self_name:
+            raise SelfRefused(f"a workspace may only act on itself ({self_name})")
+    return [verb, *rest, *flags]
+
+
+def detach() -> bool:
+    """Double-fork. Returns True in the parent (which should exit now) and
+    False in the detached child, whose stdio is /dev/null and whose log
+    goes to syslog, so finishing the job does not depend on the ssh
+    session that asked for it (which the job is about to end)."""
+    if os.fork() > 0:
+        return True
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    devnull = os.open(os.devnull, os.O_RDWR)
+    for fd in (0, 1, 2):
+        os.dup2(devnull, fd)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    return False
+
+
+def main(argv: list[str] | None = None, self_name: str | None = None) -> int:
     parser = build_parser()
     try:
+        if self_name is not None:
+            argv = self_argv(list(argv or []), self_name)
         args = parser.parse_args(argv)
     except SystemExit as e:
         return int(e.code or 0)
+    except OrchardError as e:
+        print(f"dev: {e}", file=sys.stderr)
+        return 1
     try:
         cfg = Config.load()
         mgr = Manager(cfg, Incus(cfg.incus))
+        if self_name is not None and args.cmd in SELF_DETACHED:
+            what = {
+                "stop": f"stopping {self_name}",
+                "rm": f"removing {self_name}; its volume is kept {cfg.rm_grace_days} days as trash",
+                "rename": f"renaming {self_name} to {getattr(args, 'new', '?')}; reconnect under the new name",
+            }[args.cmd]
+            print(f"{what}; this session ends now", file=sys.stderr, flush=True)
+            if detach():
+                return 0
+            syslog.openlog("orchard")
+            mgr.log = lambda m: syslog.syslog(f"{self_name}: {m}")
+            args.json = False
+            sys.stdout = open(os.devnull, "w")
         return args.fn(mgr, args)
     except OrchardError as e:
         print(f"dev: {e}", file=sys.stderr)
