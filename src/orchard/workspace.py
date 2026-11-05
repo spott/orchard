@@ -486,7 +486,7 @@ class Manager:
         try:
             key = os.path.join(tmp, "self.key")
             proc = subprocess.run(
-                ["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", f"orchard:{ws.name}", "-f", key],
+                [cfg.ssh_keygen, "-q", "-t", "ed25519", "-N", "", "-C", f"orchard:{ws.name}", "-f", key],
                 capture_output=True, text=True, stdin=subprocess.DEVNULL,
             )
             if proc.returncode != 0:

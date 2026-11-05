@@ -23,6 +23,7 @@ let
     address_end = if cfg.addresses == null then "" else cfg.addresses.end;
     self_host = if cfg.self.enable then cfg.self.host else "";
     self_hostkey_file = cfg.self.hostKeyFile;
+    ssh_keygen = "${pkgs.openssh}/bin/ssh-keygen";
     dns_listen = cfg.wake.listen;
     dns_port = cfg.wake.port;
     dns_zone = cfg.wake.zone;
@@ -236,6 +237,7 @@ in
       requires = [ "incus.service" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
+      path = [ config.virtualisation.incus.package pkgs.openssh ];
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/orchard-dns";
         User = cfg.user;
@@ -253,6 +255,7 @@ in
       description = "orchard: reap trashed workspace volumes";
       after = [ "incus.service" ];
       requires = [ "incus.service" ];
+      path = [ config.virtualisation.incus.package ];
       serviceConfig = {
         Type = "oneshot";
         User = cfg.user;

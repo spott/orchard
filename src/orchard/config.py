@@ -48,6 +48,7 @@ class Config:
     # (the Incus bridge), and the host key it pins. Empty = not installed.
     self_host: str = ""
     self_hostkey_file: str = "/etc/ssh/ssh_host_ed25519_key.pub"
+    ssh_keygen: str = "ssh-keygen"
     # The wake resolver (`orchard-dns`): a lookup of `<name>.<zone>` starts
     # a stopped workspace, or creates a missing one when dns_create is set.
     dns_listen: str = ""
