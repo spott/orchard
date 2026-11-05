@@ -33,7 +33,9 @@ SELF_CLIENT = """#!/bin/sh
 # orchard: manage THIS workspace from inside it (rename, rm, stop, status, ls).
 # Installed by the host; the key in ~/.orchard only speaks for this workspace.
 d="$HOME/.orchard"
-exec ssh -o LogLevel=ERROR -o BatchMode=yes -o IdentitiesOnly=yes -i "$d/self.key" \
+# -F /dev/null: the user's own ssh config must not apply (ControlPath,
+# ProxyCommand, IdentityAgent, ...); this connection is fully specified here.
+exec ssh -F /dev/null -o LogLevel=ERROR -o BatchMode=yes -o IdentitiesOnly=yes -i "$d/self.key" \
   -o UserKnownHostsFile="$d/known_hosts" -o StrictHostKeyChecking=yes \
   "dev@{host}" dev "$@"
 """

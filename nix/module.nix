@@ -219,7 +219,10 @@ in
     };
     environment.systemPackages = [ cfg.package ];
 
-    systemd.tmpfiles.rules = [ "d /run/orchard 0770 root incus-admin -" ];
+    # setgid: lock files made by the resolver's user (dev) and by operators'
+    # shells must all belong to incus-admin, or `dev rm` fails on a lock the
+    # other side created.
+    systemd.tmpfiles.rules = [ "d /run/orchard 2770 root incus-admin -" ];
 
     # Match blocks must come after every global directive; NixOS appends
     # extraConfig after its generated settings, and its own extraConfig
