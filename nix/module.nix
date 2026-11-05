@@ -207,12 +207,22 @@ in
     };
 
     environment.etc."orchard/config.json".source = configFile;
+    # A real file (mode set => copied, not symlinked): sshd resolves symlinks
+    # before its ownership check and then refuses /nix/store, which is
+    # group-writable ("bad ownership or modes for directory /nix/store").
     environment.etc."ssh/orchard-authorized-keys" = lib.mkIf cfg.self.enable {
-      source = "${cfg.package}/bin/orchard-authorized-keys";
+      mode = "0755";
+      text = ''
+        #!${pkgs.runtimeShell}
+        exec ${cfg.package}/bin/orchard-authorized-keys "$@"
+      '';
     };
     environment.systemPackages = [ cfg.package ];
 
-    systemd.tmpfiles.rules = [ "d /run/orchard 0770 root incus-admin -" ];
+    # setgid: lock files made by the resolver's user (dev) and by operators'
+    # shells must all belong to incus-admin, or `dev rm` fails on a lock the
+    # other side created.
+    systemd.tmpfiles.rules = [ "d /run/orchard 2770 root incus-admin -" ];
 
     # Match blocks must come after every global directive; NixOS appends
     # extraConfig after its generated settings, and its own extraConfig
@@ -227,9 +237,9 @@ in
         X11Forwarding no
         PermitTunnel no
         ${lib.optionalString cfg.self.enable ''
-          # Workspaces' self-service keys, and which one authenticated. Via
-          # /etc: sshd refuses a command under /nix/store ("bad ownership or
-          # modes for directory /nix/store", which is group-writable).
+          # Workspaces' self-service keys, and which one authenticated. A
+          # wrapper copied into /etc: sshd refuses a command that resolves
+          # into /nix/store (see environment.etc above).
           AuthorizedKeysCommand /etc/ssh/orchard-authorized-keys %u
           AuthorizedKeysCommandUser ${cfg.user}
           ExposeAuthInfo yes
