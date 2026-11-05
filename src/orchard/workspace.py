@@ -33,7 +33,7 @@ SELF_CLIENT = """#!/bin/sh
 # orchard: manage THIS workspace from inside it (rename, rm, stop, status, ls).
 # Installed by the host; the key in ~/.orchard only speaks for this workspace.
 d="$HOME/.orchard"
-exec ssh -q -o BatchMode=yes -o IdentitiesOnly=yes -i "$d/self.key" \
+exec ssh -o LogLevel=ERROR -o BatchMode=yes -o IdentitiesOnly=yes -i "$d/self.key" \
   -o UserKnownHostsFile="$d/known_hosts" -o StrictHostKeyChecking=yes \
   "dev@{host}" dev "$@"
 """
@@ -466,7 +466,23 @@ class Manager:
         if ws.selfkey is None:
             # A workspace from before self-service existed: adopt it.
             self._install_self(ws)
+        elif self.cfg.self_host:
+            # Keep the client current with this version of dev.
+            self._push_client(ws)
         return ws
+
+    def _push_client(self, ws: Workspace) -> None:
+        cfg = self.cfg
+        tmp = tempfile.mkdtemp(prefix="orchard-self-")
+        try:
+            client = os.path.join(tmp, "dev")
+            with open(client, "w") as f:
+                f.write(SELF_CLIENT.format(host=cfg.self_host))
+            self.inc.file_push(client, ws.name, f"/home/{cfg.user}/.local/bin/dev", uid=cfg.uid, gid=cfg.gid, mode="0755")
+        except IncusError as e:
+            self.log(f"warning: could not update the dev client in {ws.name}: {e}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     def _install_self(self, ws: Workspace) -> None:
         """Generate the workspace's self-service key pair: public half on the

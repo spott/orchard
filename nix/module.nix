@@ -207,6 +207,9 @@ in
     };
 
     environment.etc."orchard/config.json".source = configFile;
+    environment.etc."ssh/orchard-authorized-keys" = lib.mkIf cfg.self.enable {
+      source = "${cfg.package}/bin/orchard-authorized-keys";
+    };
     environment.systemPackages = [ cfg.package ];
 
     systemd.tmpfiles.rules = [ "d /run/orchard 0770 root incus-admin -" ];
@@ -224,8 +227,10 @@ in
         X11Forwarding no
         PermitTunnel no
         ${lib.optionalString cfg.self.enable ''
-          # Workspaces' self-service keys, and which one authenticated.
-          AuthorizedKeysCommand ${cfg.package}/bin/orchard-authorized-keys %u
+          # Workspaces' self-service keys, and which one authenticated. Via
+          # /etc: sshd refuses a command under /nix/store ("bad ownership or
+          # modes for directory /nix/store", which is group-writable).
+          AuthorizedKeysCommand /etc/ssh/orchard-authorized-keys %u
           AuthorizedKeysCommandUser ${cfg.user}
           ExposeAuthInfo yes
         ''}

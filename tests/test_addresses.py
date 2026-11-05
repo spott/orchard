@@ -145,6 +145,12 @@ def test_self_service_install(acfg, inc, logs, tmp_path, monkeypatch):
     inc.calls.clear()
     assert mgr.start("old").selfkey is not None
     assert ("config_set", "old", {KEY + "selfkey": "ssh-ed25519 AAAASELF orchard:foo"}) in inc.calls
+    # Starting one that has a key only refreshes the client.
+    inc.stop("foo")
+    inc.calls.clear()
+    mgr.start("foo")
+    assert [c[0] for c in inc.calls] == ["start", "file_push"]
+    assert inc.calls[1][2] == "/home/spott/.local/bin/dev"
 
 
 def test_self_service_skipped_without_host_or_hostkey(amgr, inc, logs, tmp_path):
