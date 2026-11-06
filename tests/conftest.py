@@ -24,6 +24,10 @@ class FakeIncus(Incus):
         self.next_ip = 10
         self.journal: dict[str, str] = {}
         self.files: dict[str, dict[str, str]] = {}
+        self.images: dict[str, str] = {"workspace": "4f465639deadbeefcafe"}
+        self.snaps: dict[str, list[str]] = {}
+        self.exec_out: dict[str, tuple[int, str, str]] = {}
+        self.execs: list[tuple[Any, ...]] = []
 
     def _maybe_fail(self, op: str) -> None:
         if op in self.fail_on:
@@ -45,7 +49,7 @@ class FakeIncus(Incus):
         self.inst[name] = {
             "name": name,
             "status": "Stopped",
-            "config": {"volatile.base_image": "4f465639deadbeefcafe", **config},
+            "config": {"volatile.base_image": self.images.get(image, image), **config},
             "devices": {},
             "state": {"network": {}},
         }
@@ -77,10 +81,25 @@ class FakeIncus(Incus):
         self.calls.append(("rename", old, new))
         self.inst[new] = self.inst.pop(old)
         self.inst[new]["name"] = new
+        if old in self.files:
+            self.files[new] = self.files.pop(old)
 
     def config_set(self, name, config):
         self.calls.append(("config_set", name, dict(config)))
         self.inst[name]["config"].update(config)
+
+    def config_unset(self, name, *keys):
+        self.calls.append(("config_unset", name, keys))
+        for k in keys:
+            self.inst[name]["config"].pop(k, None)
+
+    def image_fingerprint(self, ref):
+        if ref in self.images:
+            return self.images[ref]
+        for fp in self.images.values():
+            if fp.startswith(ref):
+                return fp
+        return None
 
     def device_add(self, name, device, kind, **props):
         self._maybe_fail("device_add")
@@ -102,17 +121,36 @@ class FakeIncus(Incus):
         self.calls.append(("device_set", name, device, dict(props)))
         self.inst[name]["devices"][device].update(props)
 
-    def exec(self, name, *cmd, check=True):
+    def device_remove(self, name, device):
+        self.calls.append(("device_remove", name, device))
+        del self.inst[name]["devices"][device]
+
+    def exec(self, name, *cmd, check=True, user=None, group=None, env=None):
         import subprocess
         self.calls.append(("exec", name, cmd))
-        out = self.journal.get(name, "") if cmd and cmd[0] == "journalctl" else ""
-        return subprocess.CompletedProcess([self.binary, "exec", name, *cmd], 0, out, "")
+        self.execs.append((name, cmd, user, group, env))
+        if cmd and cmd[0] == "journalctl":
+            return subprocess.CompletedProcess([self.binary, "exec", name, *cmd], 0, self.journal.get(name, ""), "")
+        rc, out, err = self.exec_out.get(name, (0, "", ""))
+        if check and rc != 0:
+            raise IncusError([self.binary, "exec", name, *cmd], rc, err)
+        return subprocess.CompletedProcess([self.binary, "exec", name, *cmd], rc, out, err)
 
     def file_push(self, src, name, dst, *, uid=None, gid=None, mode=None):
         with open(src) as f:
             content = f.read()
         self.calls.append(("file_push", name, dst, uid, gid, mode))
         self.files.setdefault(name, {})[dst] = content
+
+    def file_pull(self, name, src, dst, check=True):
+        content = self.files.get(name, {}).get(src)
+        if content is None:
+            if check:
+                raise IncusError([self.binary, "file", "pull", f"{name}{src}"], 1, "not found")
+            return False
+        with open(dst, "w") as f:
+            f.write(content)
+        return True
 
     # volumes
     def volumes(self, pool):
@@ -134,14 +172,32 @@ class FakeIncus(Incus):
     def volume_rename(self, pool, old, new):
         self.calls.append(("volume_rename", pool, old, new))
         self.vols[new] = self.vols.pop(old)
+        if old in self.snaps:
+            self.snaps[new] = self.snaps.pop(old)
 
     def volume_copy(self, pool, src, dst):
+        self._maybe_fail("volume_copy")
         self.calls.append(("volume_copy", pool, src, dst))
         self.vols[dst] = copy.deepcopy(self.vols[src])
 
     def volume_set(self, pool, name, config):
         self.calls.append(("volume_set", pool, name, dict(config)))
         self.vols[name]["config"].update(config)
+
+    def volume_snapshots(self, pool, name):
+        return list(self.snaps.get(name, []))
+
+    def volume_snapshot(self, pool, name, snapshot):
+        self.calls.append(("volume_snapshot", pool, name, snapshot))
+        self.snaps.setdefault(name, []).append(snapshot)
+
+    def volume_snapshot_restore(self, pool, name, snapshot):
+        self.calls.append(("volume_snapshot_restore", pool, name, snapshot))
+        assert snapshot in self.snaps.get(name, [])
+
+    def volume_snapshot_delete(self, pool, name, snapshot):
+        self.calls.append(("volume_snapshot_delete", pool, name, snapshot))
+        self.snaps[name].remove(snapshot)
 
 
 FROZEN = datetime(2026, 11, 1, 12, 0, 0, tzinfo=timezone.utc)

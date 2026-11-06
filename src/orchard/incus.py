@@ -73,6 +73,10 @@ class Incus:
     def config_set(self, name: str, config: dict[str, str]) -> None:
         self.run("config", "set", name, *[f"{k}={v}" for k, v in config.items()])
 
+    def config_unset(self, name: str, *keys: str) -> None:
+        for key in keys:
+            self.run("config", "unset", name, key)
+
     def device_add(self, name: str, device: str, kind: str, **props: str) -> None:
         self.run("config", "device", "add", name, device, kind, *[f"{k}={v}" for k, v in props.items()])
 
@@ -85,11 +89,30 @@ class Incus:
     def device_set(self, name: str, device: str, **props: str) -> None:
         self.run("config", "device", "set", name, device, *[f"{k}={v}" for k, v in props.items()])
 
-    def exec(self, name: str, *cmd: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-        return self.run("exec", name, "--", *cmd, check=check)
+    def device_remove(self, name: str, device: str) -> None:
+        self.run("config", "device", "remove", name, device)
 
-    def file_pull(self, name: str, src: str, dst: str) -> None:
-        self.run("file", "pull", f"{name}{src}", dst)
+    def exec(
+        self,
+        name: str,
+        *cmd: str,
+        check: bool = True,
+        user: int | None = None,
+        group: int | None = None,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        args = ["exec", name]
+        if user is not None:
+            args += ["--user", str(user)]
+        if group is not None:
+            args += ["--group", str(group)]
+        for k, v in (env or {}).items():
+            args += ["--env", f"{k}={v}"]
+        return self.run(*args, "--", *cmd, check=check)
+
+    def file_pull(self, name: str, src: str, dst: str, check: bool = True) -> bool:
+        """Works on stopped instances too. False when the file is missing (check=False)."""
+        return self.run("file", "pull", f"{name}{src}", dst, check=check).returncode == 0
 
     def file_push(self, src: str, name: str, dst: str, *, uid: int | None = None, gid: int | None = None, mode: str | None = None) -> None:
         args = ["file", "push", "--create-dirs"]
@@ -100,6 +123,16 @@ class Incus:
         if mode is not None:
             args += ["--mode", mode]
         self.run(*args, src, f"{name}{dst}")
+
+    # -- images -------------------------------------------------------------
+
+    def image_fingerprint(self, ref: str) -> str | None:
+        """Full fingerprint of the image an alias or fingerprint prefix names."""
+        for img in self.json("image", "list", ref):
+            fp = img.get("fingerprint", "")
+            if fp.startswith(ref) or any(a.get("name") == ref for a in img.get("aliases") or []):
+                return fp
+        return None
 
     # -- custom storage volumes ---------------------------------------------
 
@@ -126,3 +159,15 @@ class Incus:
 
     def volume_set(self, pool: str, name: str, config: dict[str, str]) -> None:
         self.run("storage", "volume", "set", pool, name, *[f"{k}={v}" for k, v in config.items()])
+
+    def volume_snapshots(self, pool: str, name: str) -> list[str]:
+        return [s["name"] for s in self.json("storage", "volume", "snapshot", "list", pool, name)]
+
+    def volume_snapshot(self, pool: str, name: str, snapshot: str) -> None:
+        self.run("storage", "volume", "snapshot", "create", pool, name, snapshot)
+
+    def volume_snapshot_restore(self, pool: str, name: str, snapshot: str) -> None:
+        self.run("storage", "volume", "snapshot", "restore", pool, name, snapshot)
+
+    def volume_snapshot_delete(self, pool: str, name: str, snapshot: str) -> None:
+        self.run("storage", "volume", "snapshot", "delete", pool, name, snapshot)

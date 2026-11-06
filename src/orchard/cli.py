@@ -83,6 +83,36 @@ def cmd_gc(mgr: Manager, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_fork(mgr: Manager, args: argparse.Namespace) -> int:
+    ws = mgr.fork(args.parent, args.as_name)
+    _emit(args, ws.as_dict(), f"{ws.name} {ws.status} {ws.ip} (fork of {ws.parent})")
+    return 0
+
+
+def cmd_rebase(mgr: Manager, args: argparse.Namespace) -> int:
+    if args.prune:
+        removed = mgr.rebase_prune(args.name)
+        _emit(args, {"removed": removed}, "\n".join(f"removed {n}" for n in removed) or f"nothing to prune for {args.name}")
+        return 0
+    if args.rollback:
+        ws, parked = mgr.rebase_rollback(args.name, restore=args.restore)
+        _emit(args, {**ws.as_dict(), "parked": parked}, f"{ws.name} {ws.status} {ws.ip} image {ws.image} (rebased instance kept as {parked})")
+        return 0
+    ws, old = mgr.rebase(args.name, args.image)
+    if old is None:
+        _emit(args, {**ws.as_dict(), "previous": None}, f"{ws.name} already on image {ws.image}")
+    else:
+        _emit(args, {**ws.as_dict(), "previous": old}, f"{ws.name} {ws.status} {ws.ip} image {ws.image} (previous instance kept as {old})")
+    return 0
+
+
+def cmd_update(mgr: Manager, args: argparse.Namespace) -> int:
+    report = mgr.update(args.names or None)
+    human = "\n".join(f"{name}: {line}" for name, lines in report.items() for line in lines)
+    _emit(args, report, human)
+    return 0 if all(not line.startswith("failed") for lines in report.values() for line in lines) else 1
+
+
 def cmd_proxy(mgr: Manager, args: argparse.Namespace) -> int:
     from .front_door import proxy
 
@@ -125,6 +155,17 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--tree", action="store_true", help="also delete forks of it")
     g = add("gc", cmd_gc, "delete trashed volumes past the grace period")
     g.add_argument("--dry-run", action="store_true")
+    f = add("fork", cmd_fork, "copy a workspace (volume and image) into a new one with fresh identity")
+    f.add_argument("parent")
+    f.add_argument("--as", dest="as_name", metavar="CHILD", help="name of the fork (default: <parent>-N)")
+    b = add("rebase", cmd_rebase, "move a workspace onto another image, keeping volume, address and identity")
+    b.add_argument("name")
+    b.add_argument("--image", help="image alias or fingerprint (default: configured image)")
+    b.add_argument("--rollback", action="store_true", help="swap the previous instance back in")
+    b.add_argument("--restore", action="store_true", help="with --rollback: also reset the volume to the pre-rebase snapshot")
+    b.add_argument("--prune", action="store_true", help="delete the previous instances and pre-rebase snapshots")
+    u = add("update", cmd_update, "re-lock project flakes under ~/work to the image's nixpkgs")
+    u.add_argument("names", nargs="*", help="workspaces (default: every running one)")
     add("proxy", cmd_proxy, "front-door path: ensure running, then relay stdio to its sshd").add_argument("host")
     return p
 

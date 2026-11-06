@@ -25,6 +25,42 @@ KEY = "user.orchard."
 WORK_DEVICE = "work"
 NIC_DEVICE = "eth0"
 STAMP = "%Y%m%dT%H%M%SZ"
+SNAPSHOT_PREFIX = "pre-rebase-"
+
+# What `rebase` carries from the old instance to its replacement so the
+# workspace keeps its ssh identity (host keys, machine-id) and its
+# self-service key. (root-owned, mode) per path; the user's files are below.
+IDENTITY_FILES = {
+    "/etc/machine-id": "0444",
+    "/etc/ssh/ssh_host_ed25519_key": "0600",
+    "/etc/ssh/ssh_host_ed25519_key.pub": "0644",
+    "/etc/ssh/ssh_host_rsa_key": "0600",
+    "/etc/ssh/ssh_host_rsa_key.pub": "0644",
+    "/etc/ssh/ssh_host_ecdsa_key": "0600",
+    "/etc/ssh/ssh_host_ecdsa_key.pub": "0644",
+}
+USER_IDENTITY_FILES = {".orchard/self.key": "0600", ".orchard/known_hosts": "0644"}
+
+# `update`: re-lock every project flake under ~/work to the image's pinned
+# nixpkgs (the registry inside the image points `nixpkgs`/`nixpkgs-stable`
+# at the exact revs). One line per input touched: `ok|failed <dir> <input>`.
+UPDATE_SCRIPT = r"""
+set -u
+cd "$HOME/work" 2>/dev/null || exit 0
+status=0
+for d in */; do
+  [ -f "$d/flake.nix" ] || continue
+  for input in nixpkgs nixpkgs-stable; do
+    grep -q "\"$input\": {" "$d/flake.lock" 2>/dev/null || continue
+    if (cd "$d" && nix flake update "$input" >/dev/null 2>&1); then
+      echo "ok ${d%/} $input"
+    else
+      echo "failed ${d%/} $input"; status=1
+    fi
+  done
+done
+exit $status
+"""
 
 # Installed into every workspace as ~/.local/bin/dev: the self-service client.
 # It sshes to the host as the jump user with a per-workspace key; the host
@@ -65,6 +101,16 @@ class NoAddress(OrchardError):
         super().__init__("no free address left in the workspace address range")
 
 
+class ForkLimit(OrchardError):
+    def __init__(self, parent: str, limit: int) -> None:
+        super().__init__(f"{parent!r} already has {limit} forks (fork_limit)")
+
+
+class NoPrevious(OrchardError):
+    def __init__(self, name: str) -> None:
+        super().__init__(f"{name!r} has no previous instance to roll back to")
+
+
 @dataclass
 class Workspace:
     name: str
@@ -83,6 +129,11 @@ class Workspace:
     origin: str | None = None
     # Public half of the workspace's self-service key, if installed.
     selfkey: str | None = None
+    # Full fingerprint of the image the instance was made from (`image` is
+    # its short form); forks are made from it, rebase compares against it.
+    fingerprint: str | None = None
+    # When `rebase` last replaced the instance, if ever.
+    rebased: str | None = None
 
     @property
     def running(self) -> bool:
@@ -125,6 +176,8 @@ def from_instance(inst: dict[str, Any]) -> Workspace:
         address=_nic(inst).get("ipv4.address") or None,
         origin=cfg.get(KEY + "origin"),
         selfkey=cfg.get(KEY + "selfkey"),
+        fingerprint=image or None,
+        rebased=cfg.get(KEY + "rebased"),
     )
 
 
@@ -398,10 +451,249 @@ class Manager:
                 return ws
         return None
 
+    # -- fork / rebase / update ---------------------------------------------
+
+    def fork(self, parent: str, child: str | None = None) -> Workspace:
+        """Copy a workspace: its volume (stopped for the copy, so databases
+        on it are consistent) under a new instance made from the parent's
+        own image, with `user.orchard.parent` set. Identity is fresh: new
+        host keys, new self-service key, new address. The parent is started
+        again before the child is built, so it is down for the copy only."""
+        names.validate(parent)
+        cfg = self.cfg
+        with locks.held(cfg.lock_dir, parent):
+            ws = self.require(parent)
+            if child is None:
+                child = self.next_child_name(parent)
+            names.validate(child)
+            if child == parent:
+                raise AlreadyExists(child)
+            kids = [w for w in self.list() if w.parent == parent]
+            if len(kids) >= cfg.fork_limit:
+                raise ForkLimit(parent, cfg.fork_limit)
+            with locks.held(cfg.lock_dir, child):
+                if self.inc.instance(child) is not None:
+                    raise AlreadyExists(child)
+                src = ws.volume or names.volume(parent)
+                dst = names.volume(child)
+                if self.inc.volume(cfg.pool, dst) is not None:
+                    raise AlreadyExists(dst)
+                if ws.running:
+                    self.reserve_address(ws)
+                    self.log(f"stopping {parent} for a consistent copy")
+                    self.inc.stop(parent)
+                try:
+                    self.log(f"copying volume {src} to {dst}")
+                    self.inc.volume_copy(cfg.pool, src, dst)
+                finally:
+                    if ws.running:
+                        self._ensure_started(self.require(parent))
+                try:
+                    return self._create_locked(
+                        child, repo=ws.repo, agent=None, image=ws.fingerprint or cfg.image, origin="fork", parent=parent
+                    )
+                except OrchardError:
+                    # _create_locked keeps volumes it did not make; this one is ours.
+                    try:
+                        self.inc.volume_delete(cfg.pool, dst)
+                    except IncusError:
+                        pass
+                    raise
+
+    def next_child_name(self, parent: str) -> str:
+        """`<parent>-N` for the lowest N whose instance and volume are both free."""
+        taken = {i["name"] for i in self.inc.instances()} | {v["name"] for v in self.inc.volumes(self.cfg.pool)}
+        n = 1
+        while names.child(parent, n) in taken or names.volume(names.child(parent, n)) in taken:
+            n += 1
+        return names.child(parent, n)
+
+    def rebase(self, name: str, image: str | None = None) -> tuple[Workspace, str | None]:
+        """Move a workspace onto another image, keeping its volume, address,
+        metadata and identity (host keys, machine-id, self-service key). The
+        volume gets a `pre-rebase-<stamp>` snapshot first; the old instance is
+        kept, stopped and unmanaged, as `<name>-old-<stamp>` for `--rollback`
+        until `--prune`. Returns (workspace, old instance name or None if
+        nothing was done)."""
+        cfg = self.cfg
+        with locks.held(cfg.lock_dir, name):
+            ws = self.require(name)
+            ref = image or cfg.image
+            target = self.inc.image_fingerprint(ref)
+            if target is None:
+                raise OrchardError(f"no image {ref!r}")
+            if ws.fingerprint == target:
+                self.log(f"{name} is already on image {target[:12]}")
+                return ws, None
+            stamp = self.now().strftime(STAMP)
+            vol = ws.volume or names.volume(name)
+            if ws.running:
+                self.reserve_address(ws)
+                self.log(f"stopping {name}")
+                self.inc.stop(name)
+            snap = SNAPSHOT_PREFIX + stamp.lower()
+            self.log(f"snapshotting {vol} as {snap}")
+            self.inc.volume_snapshot(cfg.pool, vol, snap)
+            inst = self.inc.instance(name) or {}
+            meta = {k: v for k, v in (inst.get("config") or {}).items() if k.startswith(KEY)}
+            meta[KEY + "rebased"] = self.now().isoformat(timespec="seconds")
+            old = self._free_old_name(name, stamp)
+            tmp = tempfile.mkdtemp(prefix="orchard-rebase-")
+            try:
+                identity = self._pull_identity(name, tmp)
+                self.inc.device_remove(name, WORK_DEVICE)
+                self.log(f"keeping the old instance as {old}")
+                self.inc.rename(name, old)
+                self.inc.config_set(old, {KEY + "managed": "false", KEY + "old-of": name})
+                try:
+                    self.log(f"creating {name} from image {target[:12]}")
+                    self.inc.init(target, name, cfg.profiles, meta)
+                    self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+                    if ws.address:
+                        self.inc.device_override(name, NIC_DEVICE, **{"ipv4.address": ws.address})
+                    self._push_identity(name, identity)
+                except OrchardError:
+                    self.log(f"rebase failed, putting {old} back as {name}")
+                    try:
+                        self.inc.delete(name, force=True)
+                    except IncusError:
+                        pass
+                    self.inc.rename(old, name)
+                    self.inc.config_set(name, {KEY + "managed": "true"})
+                    self.inc.config_unset(name, KEY + "old-of")
+                    self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+                    raise
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            # Always start: a rebase that does not boot is a failed rebase.
+            new = self._ensure_started(self.require(name))
+            self.log(f"{name} is on image {target[:12]}; `dev rebase --rollback {name}` returns to {old}, `--prune` drops it")
+            return new, old
+
+    def rebase_rollback(self, name: str, restore: bool = False) -> tuple[Workspace, str]:
+        """Swap the newest `<name>-old-*` instance back in; the rebased
+        instance is parked the same way (prune removes both). With restore,
+        the volume is reset to the newest pre-rebase snapshot as well."""
+        cfg = self.cfg
+        with locks.held(cfg.lock_dir, name):
+            cur = self.require(name)
+            olds = self.old_instances(name)
+            if not olds:
+                raise NoPrevious(name)
+            previous = olds[-1]
+            stamp = self.now().strftime(STAMP)
+            vol = cur.volume or names.volume(name)
+            if cur.running:
+                self.log(f"stopping {name}")
+                self.inc.stop(name, force=True)
+            parked = self._free_old_name(name, stamp)
+            self.inc.device_remove(name, WORK_DEVICE)
+            self.inc.rename(name, parked)
+            self.inc.config_set(parked, {KEY + "managed": "false", KEY + "old-of": name})
+            self.log(f"restoring {previous} as {name} (the rebased instance is kept as {parked})")
+            self.inc.rename(previous, name)
+            self.inc.config_set(name, {KEY + "managed": "true"})
+            self.inc.config_unset(name, KEY + "old-of")
+            self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+            if restore:
+                snaps = sorted(s for s in self.inc.volume_snapshots(cfg.pool, vol) if s.startswith(SNAPSHOT_PREFIX))
+                if snaps:
+                    self.log(f"restoring {vol} from snapshot {snaps[-1]}")
+                    self.inc.volume_snapshot_restore(cfg.pool, vol, snaps[-1])
+                else:
+                    self.log(f"warning: {vol} has no pre-rebase snapshot to restore")
+            return self._ensure_started(self.require(name)), parked
+
+    def rebase_prune(self, name: str) -> list[str]:
+        """Delete every parked instance of `name` and its pre-rebase snapshots."""
+        cfg = self.cfg
+        with locks.held(cfg.lock_dir, name):
+            ws = self.require(name)
+            removed: list[str] = []
+            for old in self.old_instances(name):
+                self.log(f"deleting {old}")
+                self.inc.delete(old, force=True)
+                removed.append(old)
+            vol = ws.volume or names.volume(name)
+            for snap in self.inc.volume_snapshots(cfg.pool, vol):
+                if snap.startswith(SNAPSHOT_PREFIX):
+                    self.inc.volume_snapshot_delete(cfg.pool, vol, snap)
+                    removed.append(f"{vol}/{snap}")
+            return removed
+
+    def _free_old_name(self, name: str, stamp: str) -> str:
+        """`<name>-old-<stamp>`, with a counter if that already exists (a
+        rebase and its rollback inside the same second)."""
+        taken = {i["name"] for i in self.inc.instances()}
+        base = names.old_instance(name, stamp)
+        candidate, n = base, 1
+        while candidate in taken:
+            n += 1
+            candidate = f"{base}-{n}"
+        return candidate
+
+    def old_instances(self, name: str) -> list[str]:
+        """Parked instances of `name`, oldest first (the stamp in the name sorts)."""
+        return sorted(i["name"] for i in self.inc.instances() if (i.get("config") or {}).get(KEY + "old-of") == name)
+
+    def update(self, only: list[str] | None = None) -> dict[str, list[str]]:
+        """Re-lock each project flake under ~/work of the named (default: all
+        running) workspaces to the image's pinned nixpkgs. Returns one line
+        per (project, input) per workspace."""
+        cfg = self.cfg
+        targets = [self.require(n) for n in only] if only else [w for w in self.list() if w.running]
+        report: dict[str, list[str]] = {}
+        for ws in targets:
+            if not ws.running:
+                report[ws.name] = ["skipped: not running"]
+                continue
+            with locks.held(cfg.lock_dir, ws.name):
+                self.log(f"updating project flakes in {ws.name}")
+                proc = self.inc.exec(
+                    ws.name, "sh", "-lc", UPDATE_SCRIPT,
+                    check=False, user=cfg.uid, group=cfg.gid, env={"HOME": f"/home/{cfg.user}"},
+                )
+                lines = proc.stdout.strip().splitlines()
+                if not lines:
+                    lines = ["nothing to update"] if proc.returncode == 0 else [f"failed: {proc.stderr.strip()}"]
+                report[ws.name] = lines
+        return report
+
+    def _pull_identity(self, name: str, tmp: str) -> dict[str, tuple[str, int, int, str]]:
+        """Copy the identity files out of a (stopped) instance. Returns
+        {container path: (local path, uid, gid, mode)} for the ones present."""
+        cfg = self.cfg
+        found: dict[str, tuple[str, int, int, str]] = {}
+        wanted = dict(IDENTITY_FILES)
+        home = f"/home/{cfg.user}"
+        for rel, mode in USER_IDENTITY_FILES.items():
+            wanted[f"{home}/{rel}"] = mode
+        for i, (path, mode) in enumerate(wanted.items()):
+            local = os.path.join(tmp, f"id{i}")
+            if self.inc.file_pull(name, path, local, check=False):
+                owner = (cfg.uid, cfg.gid) if path.startswith(home + "/") else (0, 0)
+                found[path] = (local, owner[0], owner[1], mode)
+        return found
+
+    def _push_identity(self, name: str, identity: dict[str, tuple[str, int, int, str]]) -> None:
+        for path, (local, uid, gid, mode) in identity.items():
+            self.inc.file_push(local, name, path, uid=uid, gid=gid, mode=mode)
+        home = f"/home/{self.cfg.user}"
+        if any(p.startswith(home + "/") for p in identity):
+            self.inc.exec(name, "chown", f"{self.cfg.uid}:{self.cfg.gid}", f"{home}/.orchard", check=False)
+
     # -- internals ----------------------------------------------------------
 
     def _create_locked(
-        self, name: str, *, repo: str | None, agent: str | None, image: str, origin: str = "cli", address: str | None = None
+        self,
+        name: str,
+        *,
+        repo: str | None,
+        agent: str | None,
+        image: str,
+        origin: str = "cli",
+        address: str | None = None,
+        parent: str | None = None,
     ) -> Workspace:
         cfg = self.cfg
         vol = names.volume(name)
@@ -435,6 +727,8 @@ class Manager:
             meta[KEY + "repo"] = repo
         if agent:
             meta[KEY + "agent"] = agent
+        if parent:
+            meta[KEY + "parent"] = parent
         self.log(f"creating {name} from image {image}")
         try:
             self.inc.init(image, name, cfg.profiles, meta)
