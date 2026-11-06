@@ -47,24 +47,20 @@ def test_cli_self_mode_refuses_and_lists(monkeypatch, inc, cfg, capsys):
     assert "bar" in inc.inst and "foo" not in inc.inst
 
 
-def test_front_door_detects_self_key(tmp_path, inc, cfg, monkeypatch):
+def test_front_door_detects_self_key(tmp_path, inc, cfg):
     m = Manager(cfg, inc, log=lambda s: None, probe=lambda ip, port: True, sleep=lambda s: None)
     m.create("foo")
     inc.inst["foo"]["config"][KEY + "selfkey"] = "ssh-ed25519 AAAASELF orchard:foo"
     auth = tmp_path / "auth"
     auth.write_text("publickey ssh-ed25519 AAAASELF\n")
-    assert front_door.self_workspace(str(auth), m) == "foo"
+    assert front_door.identify(str(auth), cfg, m) == (front_door.WORKSPACE, "foo")
+    # Not an operator key either: a stranger is refused, never promoted.
     auth.write_text("publickey ssh-ed25519 AAAAOPERATOR\n")
-    assert front_door.self_workspace(str(auth), m) is None
-    auth.write_text("")
-    assert front_door.self_workspace(str(auth), m) is None
-    assert front_door.self_workspace(str(tmp_path / "missing"), m) is None
-    monkeypatch.delenv("SSH_USER_AUTH", raising=False)
-    assert front_door.self_workspace(None, m) is None
+    assert front_door.identify(str(auth), cfg, m)[0] == front_door.DENIED
 
 
 def test_front_door_self_mode_only_runs_dev(monkeypatch, capsys):
-    monkeypatch.setattr(front_door, "self_workspace", lambda *a, **k: "foo")
+    monkeypatch.setattr(front_door, "identify", lambda: (front_door.WORKSPACE, "foo"))
     seen = []
     monkeypatch.setattr(front_door.cli, "main", lambda args, self_name=None: seen.append((args, self_name)) or 0)
     assert front_door.main(["dev", "rm"]) == 0

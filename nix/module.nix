@@ -19,6 +19,7 @@ let
     hooks = lib.filterAttrs (_: v: v != null) {
       on_create = cfg.hooks.onCreate;
     };
+    operator_keys = cfg.authorizedKeys;
     address_start = if cfg.addresses == null then "" else cfg.addresses.start;
     address_end = if cfg.addresses == null then "" else cfg.addresses.end;
     self_host = if cfg.self.enable then cfg.self.host else "";
@@ -54,7 +55,12 @@ in
     authorizedKeys = lib.mkOption {
       type = lib.types.listOf lib.types.str;
       default = [ ];
-      description = "Public keys allowed to use the front door.";
+      description = ''
+        Public keys that get the full front door (the operator). A key that is
+        not listed here and is not a workspace's self-service key (see
+        `self.enable`) is refused, as is a session sshd exposes no auth info
+        for: the front door never falls back to operator access.
+      '';
     };
 
     extraGroups = lib.mkOption {
