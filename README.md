@@ -39,9 +39,29 @@ Orchard is a small Python package (standard library only) plus a NixOS module:
   sshd, then relays bytes between the ssh connection and the container's
   port 22. Two clients racing to create the same workspace serialise on the
   lock; the loser just attaches.
+- **`fork PARENT [--as CHILD]`** copies a workspace: the parent is stopped
+  for the volume copy (so databases on it are consistent) and started
+  again, then the child is made from the parent's *own* image fingerprint
+  with the copy attached and `user.orchard.parent` set. Identity is fresh:
+  new host keys, new self-service key, new address. Default child name
+  `<parent>-N`; `fork_limit` caps the children per parent; `rm --tree`
+  removes a workspace with its forks.
+- **`rebase NAME [--image ALIAS]`** moves a workspace onto another image
+  keeping its volume, address, metadata and identity (host keys,
+  machine-id, self-service key are copied over). The volume gets a
+  `pre-rebase-<stamp>` snapshot first and the old instance is parked,
+  stopped and unmanaged, as `<name>-old-<stamp>`. `rebase --rollback NAME`
+  swaps the parked instance back (`--restore` also resets the volume to the
+  snapshot); `rebase --prune NAME` deletes parked instances and snapshots.
+  Same image as the current one: no-op.
+- **`update [NAME...]`** runs `nix flake update nixpkgs` (and
+  `nixpkgs-stable`) in every `~/work/*` project with a flake, as the
+  workspace user, in the named or all running workspaces: the re-lock step
+  after an image bump when the image's registry pins moved.
 - All verbs are idempotent and `--json`-capable. Exit codes: 0 ok, 1 failure,
   2 usage. A failed `create` removes what it made; a volume it adopted is
-  never deleted.
+  never deleted; a failed `fork` drops its copy; a failed `rebase` puts the
+  old instance back.
 
 ## Image contract
 
@@ -178,8 +198,6 @@ Incus. The relay has its own socketpair tests.
 
 ## Roadmap
 
-- `fork`, `rebase` (image upgrade preserving the volume and ssh identity),
-  `update`
 - nightly `incus storage volume export` backups with a restore test
 - an MCP server over the same library
 

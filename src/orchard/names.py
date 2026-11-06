@@ -59,3 +59,14 @@ def volume(name: str) -> str:
 
 def trash_volume(name: str, stamp: str) -> str:
     return f"{TRASH_PREFIX}{name}-{stamp}"
+
+
+def child(parent: str, n: int) -> str:
+    """Default name of the n-th fork of `parent`."""
+    return f"{parent}-{n}"
+
+
+def old_instance(name: str, stamp: str) -> str:
+    """Where `rebase` parks the instance it replaced (lowercase so it is still
+    a valid instance name; never a workspace: it is marked unmanaged)."""
+    return f"{name}-old-{stamp.lower()}"
