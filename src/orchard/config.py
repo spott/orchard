@@ -38,6 +38,9 @@ class Config:
     lock_dir: str = "/run/orchard"
     # event name -> executable path; see README "Hooks".
     hooks: dict[str, str] = field(default_factory=dict)
+    # Public keys the front door treats as the operator. Anything else that
+    # authenticates is a workspace's self-service key or is refused.
+    operator_keys: list[str] = field(default_factory=list)
     # Static addresses: every workspace gets a DHCP reservation from this
     # inclusive range (its `ipv4.address` on eth0), so its name has an answer
     # while it is stopped. Empty = dynamic leases only.

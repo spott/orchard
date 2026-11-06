@@ -123,6 +123,13 @@ dev rm                # volume kept for the grace period as trash-<name>-<stamp>
 dev ls                # read-only view of the others
 ```
 
+Who a session is comes only from the key sshd reports as having
+authenticated (`ExposeAuthInfo`): a key in `authorizedKeys` is the operator,
+a workspace's self-service key is that workspace, and anything else is
+refused with `access denied`, including a session for which sshd exposed no
+auth info at all. The front door never falls back to operator access when it
+cannot tell who is talking.
+
 `rename`, `stop` and `rm` end the session they were typed in (the container
 stops), so the host runs them detached after acknowledging on stderr. The
 client talks to `self.host` (the Incus bridge address), which the containers
