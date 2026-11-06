@@ -15,12 +15,23 @@ def _calls(inc, op):
 # -- fork ---------------------------------------------------------------------
 
 
-def test_fork_copies_volume_from_parent_image_with_fresh_identity(mgr, inc, cfg, tmp_path):
+def test_fork_copies_volume_from_parent_image_with_fresh_identity(mgr, inc, cfg, tmp_path, monkeypatch):
+    import subprocess
+
+    from orchard import workspace
+
     cfg.self_host = "10.42.11.2"
     hk = tmp_path / "hk.pub"
     hk.write_text("ssh-ed25519 AAAAHOST\n")
     cfg.self_hostkey_file = str(hk)
-    cfg.ssh_keygen = "ssh-keygen"
+
+    def fake_keygen(argv, **kw):  # no ssh-keygen in the nix sandbox
+        key, comment = argv[argv.index("-f") + 1], argv[argv.index("-C") + 1]
+        open(key, "w").write("PRIVATE\n")
+        open(key + ".pub", "w").write(f"ssh-ed25519 AAAA{comment.split(':')[1].upper()} {comment}\n")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(workspace.subprocess, "run", fake_keygen)
     cfg.address_start, cfg.address_end = "10.100.0.100", "10.100.0.110"
     parent = mgr.create("foo", repo="github:spott/foo", agent="claude")
     inc.vols["ws-foo"]["config"]["marker"] = "parent-data"
