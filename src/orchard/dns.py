@@ -196,6 +196,11 @@ class Resolver:
         if ws is None:
             if not self.cfg.dns_create:
                 return q.reply(rcode=RCODE_NXDOMAIN)
+            if not self.mgr.repo_allowed(label):
+                # `name.repo` for a repository the App cannot reach: a typo
+                # in the repo part costs nothing.
+                self.log(f"{label}: no such repository, not creating")
+                return q.reply(rcode=RCODE_NXDOMAIN)
             addr = self._promise(label)
             if addr is None:
                 return q.reply(rcode=RCODE_NXDOMAIN)

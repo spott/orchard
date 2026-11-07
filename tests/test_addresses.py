@@ -26,7 +26,8 @@ def test_label():
     assert names.label("foo.orchard.example.com", "orchard.example.com") == "foo"
     assert names.label("FOO.Orchard.Example.com.", "orchard.example.com") == "foo"
     assert names.label("orchard.example.com", "orchard.example.com") is None
-    assert names.label("a.foo.orchard.example.com", "orchard.example.com") is None
+    assert names.label("a.foo.orchard.example.com", "orchard.example.com") == "a.foo"
+    assert names.label("a.b.foo.orchard.example.com", "orchard.example.com") is None
     assert names.label("_gateway.orchard.example.com", "orchard.example.com") is None
     assert names.label("foo.example.com", "orchard.example.com") is None
     assert names.label("foo", "") is None

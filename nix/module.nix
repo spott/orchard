@@ -34,6 +34,18 @@ let
     dns_ttl = cfg.wake.ttl;
     dns_create = cfg.wake.createOnLookup;
     untouched_hours = cfg.wake.untouchedHours;
+    state_dir = "/var/lib/orchard";
+    github_app_id = if cfg.github.enable then toString cfg.github.appId else "";
+    github_key_file = if cfg.github.enable then cfg.github.privateKeyFile else "";
+    github_owner = cfg.github.owner;
+    github_api = cfg.github.apiUrl;
+    openssl = "${pkgs.openssl}/bin/openssl";
+    secrets_env = cfg.secrets.env;
+    secrets_token_file = if cfg.secrets.tokenFile == null then "" else cfg.secrets.tokenFile;
+    secrets_cache = "/run/orchard/secrets";
+    op = "${cfg.secrets.package}/bin/op";
+    logins_volume = if cfg.logins.enable then cfg.logins.volume else "";
+    logins_size = cfg.logins.size;
   };
   configFile = pkgs.writeText "orchard-config.json" (builtins.toJSON settings);
 in
@@ -126,6 +138,90 @@ in
       description = "Run `dev gc` daily to reap trashed volumes.";
     };
 
+    github = {
+      enable = lib.mkEnableOption ''
+        per-workspace GitHub tokens: orchard holds a GitHub App's private key
+        and mints 1-hour installation tokens limited to the repositories in a
+        workspace's grants (`dev grant`, `dev token github`)
+      '';
+      appId = lib.mkOption {
+        type = lib.types.either lib.types.int lib.types.str;
+        description = "The GitHub App's id (App settings -> General).";
+      };
+      privateKeyFile = lib.mkOption {
+        type = lib.types.str;
+        description = ''
+          Path to the App's private key (PEM), deployed out of band (a
+          Colmena/agenix/sops key). Readable by the `user` and, if operators
+          run `dev token` from their own shells, by the incus-admin group.
+          Never inside a workspace.
+        '';
+      };
+      owner = lib.mkOption {
+        type = lib.types.str;
+        description = ''
+          GitHub account the App is installed on. `name.repo` workspaces
+          clone and are granted `<owner>/<repo>`; a bare `dev grant NAME repo`
+          means the same.
+        '';
+      };
+      apiUrl = lib.mkOption {
+        type = lib.types.str;
+        default = "https://api.github.com";
+      };
+    };
+
+    secrets = {
+      env = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = { CLAUDE_CODE_OAUTH_TOKEN = "op://dev/claude/credential"; };
+        description = ''
+          Environment variables every workspace gets at start, as `op://`
+          references. `dev secrets refresh` (the timer below) reads them
+          with the 1Password service account in `tokenFile` into a cache on
+          the host; `dev` pushes the cache into
+          `/run/user/<uid>/orchard/env` (a tmpfs, mode 0600) of every
+          workspace it starts, so starts cost no 1Password requests and a
+          stopped workspace holds nothing. The image's shell should source
+          that file.
+        '';
+      };
+      tokenFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        description = "File holding the 1Password service account token (read-only access to the vault the references point into). Readable by `user`.";
+      };
+      refreshOnCalendar = lib.mkOption {
+        type = lib.types.str;
+        default = "*-*-* 00/6:00:00";
+        description = "systemd OnCalendar for `dev secrets refresh`, which also re-pushes into running workspaces.";
+      };
+      package = lib.mkOption {
+        type = lib.types.package;
+        default = pkgs._1password-cli;
+        description = "The `op` CLI.";
+      };
+    };
+
+    logins = {
+      enable = lib.mkEnableOption ''
+        one shared custom volume mounted read-write into every workspace at
+        `~/.orchard/logins` (idmapped to the workspace user), for state all
+        workspaces share such as agent login files: a re-login in any
+        workspace is seen by all
+      '';
+      volume = lib.mkOption {
+        type = lib.types.str;
+        default = "logins";
+        description = "Name of the custom volume in `pool`; created on first use.";
+      };
+      size = lib.mkOption {
+        type = lib.types.str;
+        default = "1GiB";
+      };
+    };
+
     addresses = lib.mkOption {
       type = lib.types.nullOr (lib.types.submodule {
         options = {
@@ -198,6 +294,10 @@ in
         assertion = !cfg.wake.enable || cfg.addresses != null;
         message = "services.orchard.wake needs services.orchard.addresses (a stopped workspace must have an address to answer with)";
       }
+      {
+        assertion = cfg.secrets.env == { } || cfg.secrets.tokenFile != null;
+        message = "services.orchard.secrets.env needs services.orchard.secrets.tokenFile";
+      }
     ];
 
     users.groups.${cfg.user} = { };
@@ -228,7 +328,14 @@ in
     # setgid: lock files made by the resolver's user (dev) and by operators'
     # shells must all belong to incus-admin, or `dev rm` fails on a lock the
     # other side created.
-    systemd.tmpfiles.rules = [ "d /run/orchard 2770 root incus-admin -" ];
+    systemd.tmpfiles.rules = [
+      "d /run/orchard 2770 root incus-admin -"
+      # The secrets cache and the host-side state (minted tokens, cached
+      # lists): the jump user writes, every operator (incus-admin) reads.
+      "d /run/orchard/secrets 2770 ${cfg.user} incus-admin -"
+      "d /var/lib/orchard 2770 ${cfg.user} incus-admin -"
+      "d /var/lib/orchard/github 2770 ${cfg.user} incus-admin -"
+    ];
 
     # Match blocks must come after every global directive; NixOS appends
     # extraConfig after its generated settings, and its own extraConfig
@@ -258,7 +365,7 @@ in
       requires = [ "incus.service" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
-      path = [ config.virtualisation.incus.package pkgs.openssh ];
+      path = [ config.virtualisation.incus.package pkgs.openssh pkgs.openssl ];
       serviceConfig = {
         ExecStart = "${cfg.package}/bin/orchard-dns";
         User = cfg.user;
@@ -289,6 +396,29 @@ in
       timerConfig = {
         OnCalendar = "daily";
         RandomizedDelaySec = "1h";
+        Persistent = true;
+      };
+    };
+
+    systemd.services.orchard-secrets = lib.mkIf (cfg.secrets.env != { }) {
+      description = "orchard: refresh the secrets cache and push it into running workspaces";
+      after = [ "incus.service" "network-online.target" ];
+      requires = [ "incus.service" ];
+      wants = [ "network-online.target" ];
+      path = [ config.virtualisation.incus.package cfg.secrets.package ];
+      serviceConfig = {
+        Type = "oneshot";
+        User = cfg.user;
+        Group = cfg.user;
+        ExecStart = "${cfg.package}/bin/dev secrets refresh";
+      };
+    };
+    systemd.timers.orchard-secrets = lib.mkIf (cfg.secrets.env != { }) {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "2min";
+        OnCalendar = cfg.secrets.refreshOnCalendar;
+        RandomizedDelaySec = "10min";
         Persistent = true;
       };
     };

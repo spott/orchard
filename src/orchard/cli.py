@@ -10,10 +10,12 @@ import sys
 import syslog
 from typing import Any
 
+from datetime import timedelta
+
 from . import OrchardError, __version__
 from .config import Config
 from .incus import Incus
-from .workspace import Manager, Workspace
+from .workspace import Manager, Workspace, active_grants
 
 
 def _emit(args: argparse.Namespace, data: Any, human: str) -> None:
@@ -23,13 +25,21 @@ def _emit(args: argparse.Namespace, data: Any, human: str) -> None:
         print(human)
 
 
+def _grants_cell(ws: Workspace) -> str:
+    cells = []
+    for g in ws.grants:
+        live = g in active_grants(ws.grants)
+        cells.append(f"{g['value']}{'' if live else ' (expired)'}")
+    return ",".join(cells) or "-"
+
+
 def _row(ws: Workspace) -> str:
-    return f"{ws.name:<24} {ws.status:<8} {ws.ip or '-':<15} {ws.parent or '-':<16} {ws.image or '-'}"
+    return f"{ws.name:<24} {ws.status:<8} {ws.ip or '-':<15} {ws.parent or '-':<16} {ws.image or '-':<12} {_grants_cell(ws)}"
 
 
 def cmd_ls(mgr: Manager, args: argparse.Namespace) -> int:
     wss = mgr.list()
-    header = f"{'NAME':<24} {'STATUS':<8} {'IP':<15} {'PARENT':<16} IMAGE"
+    header = f"{'NAME':<24} {'STATUS':<8} {'IP':<15} {'PARENT':<16} {'IMAGE':<12} GRANTS"
     _emit(args, [w.as_dict() for w in wss], "\n".join([header, *map(_row, wss)]) if wss else "")
     return 0
 
@@ -119,6 +129,81 @@ def cmd_proxy(mgr: Manager, args: argparse.Namespace) -> int:
     return proxy(args.host, mgr.cfg)
 
 
+def _expiry(mgr: Manager, spec: str | None) -> str | None:
+    """`--for 2h|30m|3d` or an ISO timestamp -> ISO timestamp."""
+    if not spec:
+        return None
+    units = {"m": "minutes", "h": "hours", "d": "days"}
+    if spec[-1] in units and spec[:-1].isdigit():
+        return (mgr.now() + timedelta(**{units[spec[-1]]: int(spec[:-1])})).isoformat(timespec="seconds")
+    try:
+        from datetime import datetime
+
+        return datetime.fromisoformat(spec).isoformat(timespec="seconds")
+    except ValueError:
+        raise OrchardError(f"--for {spec!r}: use 30m, 2h, 3d or an ISO timestamp") from None
+
+
+def _permissions(spec: str | None) -> dict[str, str] | None:
+    """`contents=read,pull_requests=write` -> dict."""
+    if not spec:
+        return None
+    out: dict[str, str] = {}
+    for item in spec.split(","):
+        k, _, v = item.partition("=")
+        if not k or v not in ("read", "write", "admin"):
+            raise OrchardError(f"--permissions {spec!r}: use name=read|write[,...]")
+        out[k.strip()] = v
+    return out
+
+
+def cmd_grant(mgr: Manager, args: argparse.Namespace) -> int:
+    ws = mgr.grant(args.name, args.kind, args.value, permissions=_permissions(args.permissions), expires=_expiry(mgr, args.for_))
+    _emit(args, ws.as_dict(), f"{ws.name} grants: {_grants_cell(ws)}")
+    return 0
+
+
+def cmd_revoke(mgr: Manager, args: argparse.Namespace) -> int:
+    ws = mgr.revoke(args.name, args.kind, args.value)
+    _emit(args, ws.as_dict(), f"{ws.name} grants: {_grants_cell(ws)}")
+    return 0
+
+
+def cmd_token(mgr: Manager, args: argparse.Namespace) -> int:
+    tok = mgr.token(args.name, args.kind)
+    if args.git:
+        # git credential helper protocol (`get`): the token is the password.
+        print(f"username=x-access-token\npassword={tok['token']}")
+        return 0
+    _emit(args, tok, tok["token"])
+    return 0
+
+
+def cmd_secrets(mgr: Manager, args: argparse.Namespace) -> int:
+    sec = mgr.secrets
+    if not sec.configured:
+        raise OrchardError("no secrets are configured on this host (services.orchard.secrets.env)")
+    if args.action == "ls":
+        keys, age = sec.cached()
+        data = {"keys": keys, "age_seconds": None if age is None else int(age), "configured": sorted(sec.cfg.secrets_env)}
+        human = "no secrets cached yet" if age is None else f"cached {int(age)}s ago: {', '.join(keys)}"
+        _emit(args, data, human)
+        return 0
+    pushed: list[str] = []
+    refreshed: list[str] = []
+    if args.action == "refresh":
+        refreshed = sec.refresh()
+    targets = [mgr.require(n) for n in args.names] if args.names else [w for w in mgr.list() if w.running]
+    for ws in targets:
+        if not ws.running:
+            mgr.log(f"{ws.name}: not running, nothing pushed")
+            continue
+        mgr._push_secrets(ws)
+        pushed.append(ws.name)
+    _emit(args, {"refreshed": refreshed, "pushed": pushed}, f"pushed into {', '.join(pushed) or 'no workspace'}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dev", description="Orchard workspaces on Incus.")
     p.add_argument("--json", action="store_true", help="machine-readable output")
@@ -136,9 +221,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     add("ls", cmd_ls, "list workspaces")
     add("status", cmd_status, "show one workspace").add_argument("name")
-    c = add("create", cmd_create, "create (or start) a workspace")
+    c = add("create", cmd_create, "create (or start) a workspace; `name.repo` clones owner/repo and grants it")
     c.add_argument("name")
-    c.add_argument("--repo", help="repository URL recorded on the workspace")
+    c.add_argument("--repo", help="repository to clone and grant (owner/repo, or repo under the configured owner)")
     c.add_argument("--agent", help="agent label recorded on the workspace")
     c.add_argument("--image", help="image alias or fingerprint (default: configured image)")
     add("start", cmd_start, "start a workspace and wait for ssh").add_argument("name")
@@ -167,11 +252,28 @@ def build_parser() -> argparse.ArgumentParser:
     u = add("update", cmd_update, "re-lock project flakes under ~/work to the image's nixpkgs")
     u.add_argument("names", nargs="*", help="workspaces (default: every running one)")
     add("proxy", cmd_proxy, "front-door path: ensure running, then relay stdio to its sshd").add_argument("host")
+    gr = add("grant", cmd_grant, "let a workspace reach something (github: a repository); tokens follow on the next mint")
+    gr.add_argument("name")
+    gr.add_argument("value", help="github: owner/repo, or repo under the configured owner")
+    gr.add_argument("--kind", default="github")
+    gr.add_argument("--for", dest="for_", metavar="DURATION", help="expire after 30m, 2h, 3d, or at an ISO timestamp")
+    gr.add_argument("--permissions", help="narrow the token: contents=read,pull_requests=write,...")
+    rv = add("revoke", cmd_revoke, "take a grant away and revoke the workspace's live tokens")
+    rv.add_argument("name")
+    rv.add_argument("value")
+    rv.add_argument("--kind", default="github")
+    t = add("token", cmd_token, "mint (or reuse) a short-lived token limited to the workspace's grants")
+    t.add_argument("kind", choices=["github"])
+    t.add_argument("name")
+    t.add_argument("--git", action="store_true", help="print it in git credential-helper form")
+    sc = add("secrets", cmd_secrets, "the secrets every workspace gets at start: refresh the cache, push, list")
+    sc.add_argument("action", choices=["refresh", "push", "ls"])
+    sc.add_argument("names", nargs="*", help="workspaces to push into (default: every running one)")
     return p
 
 
 # What a workspace may do to itself through its self-service key.
-SELF_VERBS = {"ls", "status", "stop", "rename", "rm"}
+SELF_VERBS = {"ls", "status", "stop", "rename", "rm", "token"}
 # ...and which of those end its own ssh session, so they run detached.
 SELF_DETACHED = {"stop", "rename", "rm"}
 
@@ -198,6 +300,12 @@ def self_argv(argv: list[str], self_name: str) -> list[str]:
             rest = [self_name, rest[0]]
         elif len(rest) == 2 and rest[0] != self_name:
             raise SelfRefused(f"a workspace may only rename itself ({self_name})")
+    elif verb == "token":
+        # `dev token github` -> `dev token github <self>`
+        if len(rest) == 1:
+            rest = [rest[0], self_name]
+        elif len(rest) == 2 and rest[1] != self_name:
+            raise SelfRefused(f"a workspace may only mint tokens for itself ({self_name})")
     else:
         if not rest:
             rest = [self_name]

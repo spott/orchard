@@ -65,6 +65,26 @@ class Config:
     # `gc` also removes workspaces that a lookup created (origin "dns") and
     # that nobody has logged into after this many hours: typos.
     untouched_hours: int = 24
+    # Host-side state that is not in Incus: minted tokens, cached lists.
+    state_dir: str = "/var/lib/orchard"
+    # GitHub App: orchard mints per-workspace installation tokens narrowed to
+    # the repositories in the workspace's grants. Empty app id = off.
+    github_app_id: str = ""
+    github_key_file: str = ""
+    github_owner: str = ""
+    github_api: str = "https://api.github.com"
+    openssl: str = "openssl"
+    # Secrets pushed into every workspace's tmpfs at start: environment
+    # variable -> `op://` reference, read with the 1Password service account
+    # token in secrets_token_file, cached under secrets_cache.
+    secrets_env: dict[str, str] = field(default_factory=dict)
+    secrets_token_file: str = ""
+    secrets_cache: str = "/run/orchard/secrets"
+    op: str = "op"
+    # One custom volume attached to every workspace (idmapped, read-write) for
+    # state that all of them share, such as agent logins. Empty = off.
+    logins_volume: str = ""
+    logins_size: str = "1GiB"
 
     @classmethod
     def load(cls, path: str | None = None) -> "Config":
@@ -84,3 +104,13 @@ class Config:
 
     def work_path(self) -> str:
         return f"/home/{self.user}/work"
+
+    def secrets_path(self) -> str:
+        """Where the secrets land inside a workspace: the user's runtime tmpfs."""
+        return f"/run/user/{self.uid}/orchard"
+
+    def logins_path(self) -> str:
+        return f"/home/{self.user}/.orchard/logins"
+
+    def github_enabled(self) -> bool:
+        return bool(self.github_app_id and self.github_key_file and self.github_owner)

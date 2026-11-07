@@ -125,7 +125,7 @@ def test_create_on_lookup_can_be_off(resolver):
 
 
 def test_everything_else_is_forwarded(resolver):
-    for name in ("orchard.example.com", "_gateway.orchard.example.com", "a.b.orchard.example.com", "foo.example.com"):
+    for name in ("orchard.example.com", "_gateway.orchard.example.com", "a.b.c.orchard.example.com", "foo.example.com"):
         q = query(name)
         assert resolver.respond(q) == b"FWD" + q[:2]
     assert len(resolver.forwarded) == 4 and resolver.wakes == []

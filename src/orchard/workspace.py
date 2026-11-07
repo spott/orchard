@@ -1,11 +1,16 @@
 """Workspaces: an Incus instance named after the workspace, a custom volume
 `ws-<name>` mounted at ~/work, and `user.orchard.*` config keys as the only
-metadata. There is no database; `incus list` is the source of truth."""
+metadata. There is no database; `incus list` is the source of truth.
+
+Names: the Manager speaks workspace names (`foo`, `blah.iac`); every call
+into Incus uses the instance name (`names.instance`: `blah--iac`), which is
+what `Workspace.instance` holds."""
 
 from __future__ import annotations
 
 import dataclasses
 import ipaddress
+import json
 import os
 import shutil
 import socket
@@ -19,11 +24,20 @@ from typing import Any, Callable, Iterable
 
 from . import OrchardError, locks, names
 from .config import Config
+from .github import GitHub
 from .incus import Incus, IncusError
+from .secrets import ENV_FILE, Secrets
 
 KEY = "user.orchard."
 WORK_DEVICE = "work"
+LOGINS_DEVICE = "logins"
 NIC_DEVICE = "eth0"
+GRANT_KINDS = {"github"}
+# How long `dev` waits for the workspace user's runtime tmpfs (/run/user/<uid>,
+# made by logind for the lingering user) before pushing secrets into it.
+RUNTIME_DIR_TRIES = 40
+RUNTIME_DIR_WAIT = 0.5
+GIT_CREDENTIALS = "git-credentials"
 STAMP = "%Y%m%dT%H%M%SZ"
 SNAPSHOT_PREFIX = "pre-rebase-"
 # A rename may hit EBUSY while Incus still has the instance mounted: retry.
@@ -137,6 +151,14 @@ class Workspace:
     fingerprint: str | None = None
     # When `rebase` last replaced the instance, if ever.
     rebased: str | None = None
+    # The Incus instance name (`blah--iac` for workspace `blah.iac`).
+    instance: str = ""
+    # What the workspace may reach, as `dev grant` recorded it: one dict per
+    # grant (kind, value, permissions, expires, by, at). Tokens are minted
+    # from this list, never stored in it.
+    grants: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    # Result of the clone `create` did for a `name.repo` workspace, if any.
+    clone: str | None = None
 
     @property
     def running(self) -> bool:
@@ -144,6 +166,35 @@ class Workspace:
 
     def as_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
+
+    def repos(self, now: datetime | None = None) -> list[str]:
+        """`owner/repo` of every unexpired github grant."""
+        return [g["value"] for g in active_grants(self.grants, now) if g.get("kind") == "github"]
+
+
+def parse_grants(raw: str | None) -> list[dict[str, Any]]:
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return []
+    return [g for g in data if isinstance(g, dict) and g.get("kind") and g.get("value")] if isinstance(data, list) else []
+
+
+def active_grants(grants: list[dict[str, Any]], now: datetime | None = None) -> list[dict[str, Any]]:
+    now = now or datetime.now(timezone.utc)
+    out = []
+    for g in grants:
+        exp = g.get("expires")
+        if exp:
+            when = datetime.fromisoformat(exp)
+            if when.tzinfo is None:
+                when = when.replace(tzinfo=timezone.utc)
+            if when <= now:
+                continue
+        out.append(g)
+    return out
 
 
 def _ip(inst: dict[str, Any]) -> str | None:
@@ -172,7 +223,7 @@ def from_instance(inst: dict[str, Any]) -> Workspace:
     work = (inst.get("devices") or {}).get(WORK_DEVICE) or {}
     image = cfg.get("volatile.base_image")
     return Workspace(
-        name=inst["name"],
+        name=names.display(inst["name"]),
         status=inst.get("status", "Unknown"),
         ip=_ip(inst),
         parent=cfg.get(KEY + "parent"),
@@ -186,6 +237,9 @@ def from_instance(inst: dict[str, Any]) -> Workspace:
         selfkey=cfg.get(KEY + "selfkey"),
         fingerprint=image or None,
         rebased=cfg.get(KEY + "rebased"),
+        instance=inst["name"],
+        grants=parse_grants(cfg.get(KEY + "grants")),
+        clone=cfg.get(KEY + "clone"),
     )
 
 
@@ -212,6 +266,8 @@ class Manager:
         probe: Callable[[str, int], bool] = _tcp_open,
         sleep: Callable[[float], None] = time.sleep,
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+        github: GitHub | None = None,
+        secrets: Secrets | None = None,
     ) -> None:
         self.cfg = cfg
         self.inc = inc
@@ -219,6 +275,9 @@ class Manager:
         self.probe = probe
         self.sleep = sleep
         self.now = now
+        self.github = github or (GitHub(cfg, log=self.log) if cfg.github_enabled() else None)
+        self.secrets = secrets or Secrets(cfg, log=self.log)
+        self._warned_no_cache = False
 
     # -- read side ----------------------------------------------------------
 
@@ -226,7 +285,7 @@ class Manager:
         return sorted((from_instance(i) for i in self.inc.instances() if _managed(i)), key=lambda w: w.name)
 
     def get(self, name: str) -> Workspace | None:
-        inst = self.inc.instance(names.validate(name))
+        inst = self.inc.instance(names.instance(name))
         if inst is None:
             return None
         if not _managed(inst):
@@ -280,7 +339,7 @@ class Manager:
                 # Pin the address it has now, so its name keeps answering.
                 self.reserve_address(ws)
                 self.log(f"stopping {name}")
-                self.inc.stop(name, force=force)
+                self.inc.stop(ws.instance, force=force)
             return self.require(name)
 
     def restart(self, name: str) -> Workspace:
@@ -299,19 +358,20 @@ class Manager:
         first, second = sorted([old, new])
         with locks.held(self.cfg.lock_dir, first), locks.held(self.cfg.lock_dir, second):
             ws = self.require(old)
-            if self.inc.instance(new) is not None:
+            new_inst = names.instance(new)
+            if self.inc.instance(new_inst) is not None:
                 raise AlreadyExists(new)
             if self.inc.volume(self.cfg.pool, names.volume(new)) is not None:
                 raise AlreadyExists(names.volume(new))
             if ws.running:
                 self.reserve_address(ws)
                 self.log(f"stopping {old}")
-                self.inc.stop(old, force=True)
+                self.inc.stop(ws.instance, force=True)
             self.log(f"renaming {old} to {new}")
-            self.inc.rename(old, new)
+            self.inc.rename(ws.instance, new_inst)
             if ws.volume == names.volume(old):
                 self.inc.volume_rename(self.cfg.pool, ws.volume, names.volume(new))
-                self.inc.device_set(new, WORK_DEVICE, source=names.volume(new))
+                self.inc.device_set(new_inst, WORK_DEVICE, source=names.volume(new))
             if ws.running:
                 return self._ensure_started(self.require(new))
             return self.require(new)
@@ -331,13 +391,14 @@ class Manager:
                 return removed
             if ws.running:
                 self.log(f"stopping {name}")
-                self.inc.stop(name, force=True)
+                self.inc.stop(ws.instance, force=True)
             for old in self.old_instances(name):
                 self.log(f"deleting parked {old}")
                 self.inc.delete(old, force=True)
                 removed.append(old)
             self.log(f"deleting {name}")
-            self.inc.delete(name, force=True)
+            self.inc.delete(ws.instance, force=True)
+            self._revoke_tokens(name)
             vol = ws.volume or names.volume(name)
             if self.inc.volume(self.cfg.pool, vol) is not None:
                 if now:
@@ -394,7 +455,7 @@ class Manager:
         line in the container's journal."""
         if not ws.running:
             return True
-        proc = self.inc.exec(ws.name, "journalctl", "-q", "-g", "Accepted publickey", check=False)
+        proc = self.inc.exec(ws.instance, "journalctl", "-q", "-g", "Accepted publickey", check=False)
         return proc.returncode == 0 and proc.stdout.strip() != ""
 
     # -- addresses ----------------------------------------------------------
@@ -436,7 +497,7 @@ class Manager:
         if addr is None:
             return None
         self.log(f"reserving {addr} for {ws.name}")
-        self.inc.device_override(ws.name, NIC_DEVICE, **{"ipv4.address": addr})
+        self.inc.device_override(ws.instance, NIC_DEVICE, **{"ipv4.address": addr})
         ws.address = addr
         return addr
 
@@ -484,7 +545,7 @@ class Manager:
             if len(kids) >= cfg.fork_limit:
                 raise ForkLimit(parent, cfg.fork_limit)
             with locks.held(cfg.lock_dir, child):
-                if self.inc.instance(child) is not None:
+                if self.inc.instance(names.instance(child)) is not None:
                     raise AlreadyExists(child)
                 src = ws.volume or names.volume(parent)
                 dst = names.volume(child)
@@ -493,7 +554,7 @@ class Manager:
                 if ws.running:
                     self.reserve_address(ws)
                     self.log(f"stopping {parent} for a consistent copy")
-                    self.inc.stop(parent)
+                    self.inc.stop(ws.instance)
                 try:
                     self.log(f"copying volume {src} to {dst}")
                     self.inc.volume_copy(cfg.pool, src, dst)
@@ -501,8 +562,10 @@ class Manager:
                     if ws.running:
                         self._ensure_started(self.require(parent))
                 try:
+                    # Forks inherit the parent's scope (its grants), not its tokens.
                     return self._create_locked(
-                        child, repo=ws.repo, agent=None, image=ws.fingerprint or cfg.image, origin="fork", parent=parent
+                        child, repo=ws.repo, agent=None, image=ws.fingerprint or cfg.image, origin="fork", parent=parent,
+                        grants=ws.grants,
                     )
                 except OrchardError:
                     # _create_locked keeps volumes it did not make; this one is ours.
@@ -516,7 +579,7 @@ class Manager:
         """`<parent>-N` for the lowest N whose instance and volume are both free."""
         taken = {i["name"] for i in self.inc.instances()} | {v["name"] for v in self.inc.volumes(self.cfg.pool)}
         n = 1
-        while names.child(parent, n) in taken or names.volume(names.child(parent, n)) in taken:
+        while names.instance(names.child(parent, n)) in taken or names.volume(names.child(parent, n)) in taken:
             n += 1
         return names.child(parent, n)
 
@@ -539,6 +602,7 @@ class Manager:
                 return ws, None
             stamp = self.now().strftime(STAMP)
             vol = ws.volume or names.volume(name)
+            inst_name = ws.instance
             tmp = tempfile.mkdtemp(prefix="orchard-rebase-")
             try:
                 # Pull the identity BEFORE stopping: a file pull from a stopped
@@ -546,15 +610,15 @@ class Manager:
                 # mount behind for a while (~15 s on zfs), which makes the
                 # rename below fail with EBUSY. From a running instance the
                 # pull goes through the container and leaves nothing mounted.
-                identity = self._pull_identity(name, tmp)
+                identity = self._pull_identity(inst_name, tmp)
                 if ws.running:
                     self.reserve_address(ws)
                     self.log(f"stopping {name}")
-                    self.inc.stop(name)
+                    self.inc.stop(inst_name)
                 snap = SNAPSHOT_PREFIX + stamp.lower()
                 self.log(f"snapshotting {vol} as {snap}")
                 self.inc.volume_snapshot(cfg.pool, vol, snap)
-                inst = self.inc.instance(name) or {}
+                inst = self.inc.instance(inst_name) or {}
                 meta = {k: v for k, v in (inst.get("config") or {}).items() if k.startswith(KEY)}
                 meta[KEY + "rebased"] = self.now().isoformat(timespec="seconds")
                 # The MAC is identity too: dnsmasq hands the reserved address
@@ -565,7 +629,7 @@ class Manager:
                 self.log(f"keeping the old instance as {old}")
                 # Rename first, with the volume still attached: until this
                 # succeeds nothing about the workspace has changed.
-                self._rename_settled(name, old)
+                self._rename_settled(inst_name, old)
                 try:
                     self.inc.config_set(old, {KEY + "managed": "false", KEY + "old-of": name})
                     self.inc.device_remove(old, WORK_DEVICE)
@@ -573,22 +637,23 @@ class Manager:
                     # with the other instance stopped: the parked one lets go.
                     self._release_nic(old, ws.address, hwaddr)
                     self.log(f"creating {name} from image {target[:12]}")
-                    self.inc.init(target, name, cfg.profiles, meta)
-                    self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
-                    self._claim_nic(name, ws.address, hwaddr)
-                    self._push_identity(name, identity)
+                    self.inc.init(target, inst_name, cfg.profiles, meta)
+                    self.inc.device_add(inst_name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+                    self._attach_logins(inst_name)
+                    self._claim_nic(inst_name, ws.address, hwaddr)
+                    self._push_identity(inst_name, identity)
                 except OrchardError:
                     self.log(f"rebase failed, putting {old} back as {name}")
                     try:
-                        self.inc.delete(name, force=True)
+                        self.inc.delete(inst_name, force=True)
                     except IncusError:
                         pass
-                    self._rename_settled(old, name)
-                    self.inc.config_set(name, {KEY + "managed": "true"})
-                    self.inc.config_unset(name, KEY + "old-of")
-                    if WORK_DEVICE not in ((self.inc.instance(name) or {}).get("devices") or {}):
-                        self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
-                    self._claim_nic(name, ws.address, hwaddr)
+                    self._rename_settled(old, inst_name)
+                    self.inc.config_set(inst_name, {KEY + "managed": "true"})
+                    self.inc.config_unset(inst_name, KEY + "old-of")
+                    if WORK_DEVICE not in ((self.inc.instance(inst_name) or {}).get("devices") or {}):
+                        self.inc.device_add(inst_name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+                    self._claim_nic(inst_name, ws.address, hwaddr)
                     raise
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -610,23 +675,25 @@ class Manager:
             previous = olds[-1]
             stamp = self.now().strftime(STAMP)
             vol = cur.volume or names.volume(name)
+            inst_name = cur.instance
             if cur.running:
                 self.log(f"stopping {name}")
-                self.inc.stop(name, force=True)
+                self.inc.stop(inst_name, force=True)
             parked = self._free_old_name(name, stamp)
-            cur_inst = self.inc.instance(name) or {}
+            cur_inst = self.inc.instance(inst_name) or {}
             addr = cur.address
             hwaddr = _nic(cur_inst).get("hwaddr") or (cur_inst.get("config") or {}).get(f"volatile.{NIC_DEVICE}.hwaddr")
-            self.inc.device_remove(name, WORK_DEVICE)
-            self._release_nic(name, addr, hwaddr)
-            self._rename_settled(name, parked)
+            self.inc.device_remove(inst_name, WORK_DEVICE)
+            self._release_nic(inst_name, addr, hwaddr)
+            self._rename_settled(inst_name, parked)
             self.inc.config_set(parked, {KEY + "managed": "false", KEY + "old-of": name})
             self.log(f"restoring {previous} as {name} (the rebased instance is kept as {parked})")
-            self._rename_settled(previous, name)
-            self.inc.config_set(name, {KEY + "managed": "true"})
-            self.inc.config_unset(name, KEY + "old-of")
-            self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
-            self._claim_nic(name, addr, hwaddr)
+            self._rename_settled(previous, inst_name)
+            self.inc.config_set(inst_name, {KEY + "managed": "true"})
+            self.inc.config_unset(inst_name, KEY + "old-of")
+            self.inc.device_add(inst_name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+            self._attach_logins(inst_name)
+            self._claim_nic(inst_name, addr, hwaddr)
             if restore:
                 snaps = sorted(s for s in self.inc.volume_snapshots(cfg.pool, vol) if s.startswith(SNAPSHOT_PREFIX))
                 if snaps:
@@ -729,7 +796,7 @@ class Manager:
             with locks.held(cfg.lock_dir, ws.name):
                 self.log(f"updating project flakes in {ws.name}")
                 proc = self.inc.exec(
-                    ws.name, "sh", "-lc", UPDATE_SCRIPT,
+                    ws.instance, "sh", "-lc", UPDATE_SCRIPT,
                     check=False, user=cfg.uid, group=cfg.gid, env={"HOME": f"/home/{cfg.user}"},
                 )
                 lines = proc.stdout.strip().splitlines()
@@ -773,10 +840,23 @@ class Manager:
         origin: str = "cli",
         address: str | None = None,
         parent: str | None = None,
+        grants: list[dict[str, Any]] | None = None,
     ) -> Workspace:
         cfg = self.cfg
+        inst = names.instance(name)
         vol = names.volume(name)
         made_volume = False
+        # `name.repo`, or `--repo owner/repo`: the repository to clone and
+        # the first grant. Anything else given as --repo is just recorded.
+        clone_repo = self._repo_for(name, repo)
+        if clone_repo and not repo:
+            repo = f"https://github.com/{clone_repo}"
+        elif clone_repo and repo and "/" not in repo.strip("/").split("/", 1)[-1] and "://" not in repo:
+            repo = f"https://github.com/{clone_repo}"
+        if grants is None:
+            grants = []
+            if clone_repo:
+                grants.append(self._grant("github", clone_repo, by="create"))
         if address is None:
             address = self.allocate_address()
         if self.inc.volume(cfg.pool, vol) is None:
@@ -808,19 +888,22 @@ class Manager:
             meta[KEY + "agent"] = agent
         if parent:
             meta[KEY + "parent"] = parent
+        if grants:
+            meta[KEY + "grants"] = json.dumps(grants, separators=(",", ":"))
         self.log(f"creating {name} from image {image}")
         try:
-            self.inc.init(image, name, cfg.profiles, meta)
-            self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+            self.inc.init(image, inst, cfg.profiles, meta)
+            self.inc.device_add(inst, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+            self._attach_logins(inst)
             if address:
-                self.inc.device_override(name, NIC_DEVICE, **{"ipv4.address": address})
-            self.inc.start(name)
+                self.inc.device_override(inst, NIC_DEVICE, **{"ipv4.address": address})
+            self.inc.start(inst)
             ws = self._wait_ready(name)
         except OrchardError:
             # Leave nothing half-made behind; an adopted volume is never ours to drop.
             self.log(f"create failed, removing {name}")
             try:
-                self.inc.delete(name, force=True)
+                self.inc.delete(inst, force=True)
             except IncusError:
                 pass
             if made_volume:
@@ -830,13 +913,16 @@ class Manager:
                     pass
             raise
         self._install_self(ws)
+        self._push_secrets(ws)
+        if clone_repo:
+            self._clone(ws, clone_repo)
         self._hook("on_create", ws)
         return ws
 
     def _ensure_started(self, ws: Workspace) -> Workspace:
         if not ws.running:
             self.log(f"starting {ws.name}")
-            self.inc.start(ws.name)
+            self.inc.start(ws.instance)
         ws = self._wait_ready(ws.name)
         if ws.selfkey is None:
             # A workspace from before self-service existed: adopt it.
@@ -844,7 +930,253 @@ class Manager:
         elif self.cfg.self_host:
             # Keep the client current with this version of dev.
             self._push_client(ws)
+        # Both are idempotent and cheap: a workspace from before they existed
+        # gets them the next time dev starts it, a running one on `dev start`.
+        self._attach_logins(ws.instance)
+        self._push_secrets(ws)
         return ws
+
+    # -- grants and tokens ----------------------------------------------------
+
+    def _grant(
+        self, kind: str, value: str, *, by: str, permissions: dict[str, str] | None = None, expires: str | None = None
+    ) -> dict[str, Any]:
+        if kind not in GRANT_KINDS:
+            raise OrchardError(f"unknown grant kind {kind!r} (one of: {', '.join(sorted(GRANT_KINDS))})")
+        if kind == "github":
+            value = self._full_repo(value)
+        return {
+            "kind": kind, "value": value, "permissions": permissions or None, "expires": expires,
+            "by": by, "at": self.now().isoformat(timespec="seconds"),
+        }
+
+    def _full_repo(self, value: str) -> str:
+        """`repo` -> `<owner>/repo` with the configured owner; `owner/repo` as is."""
+        value = value.strip().strip("/")
+        if "/" not in value:
+            if not self.cfg.github_owner:
+                raise OrchardError(f"{value!r}: give the repository as owner/repo (no github owner is configured)")
+            return f"{self.cfg.github_owner}/{value}"
+        if value.count("/") != 1 or "://" in value:
+            raise OrchardError(f"{value!r}: give the repository as owner/repo")
+        return value
+
+    def _repo_for(self, name: str, repo: str | None) -> str | None:
+        """The repository a new workspace is about: `--repo owner/repo` (or a
+        bare repo name), else the repo part of `name.repo`. URLs recorded
+        with --repo are left alone (None)."""
+        if repo:
+            if "://" in repo or repo.startswith("github:") or repo.count("/") > 1:
+                return None
+            try:
+                return self._full_repo(repo)
+            except OrchardError:
+                return None
+        rep = names.repo(name)
+        if rep and self.cfg.github_owner:
+            return f"{self.cfg.github_owner}/{rep}"
+        return None
+
+    def _set_grants(self, ws: Workspace, grants: list[dict[str, Any]]) -> Workspace:
+        if grants:
+            self.inc.config_set(ws.instance, {KEY + "grants": json.dumps(grants, separators=(",", ":"))})
+        else:
+            self.inc.config_unset(ws.instance, KEY + "grants")
+        return self.require(ws.name)
+
+    def grant(
+        self, name: str, kind: str, value: str, *, permissions: dict[str, str] | None = None,
+        expires: str | None = None, by: str = "operator",
+    ) -> Workspace:
+        """Add (or replace) a grant. Takes effect on the next token mint."""
+        with locks.held(self.cfg.lock_dir, name):
+            ws = self.require(name)
+            new = self._grant(kind, value, by=by, permissions=permissions, expires=expires)
+            kept = [g for g in ws.grants if (g.get("kind"), g.get("value")) != (new["kind"], new["value"])]
+            self.log(f"granting {name} {kind} {new['value']}" + (f" until {expires}" if expires else ""))
+            ws = self._set_grants(ws, kept + [new])
+            # A cached token may be wider or narrower than the new list.
+            self._revoke_tokens(name)
+            return ws
+
+    def revoke(self, name: str, kind: str, value: str) -> Workspace:
+        """Drop a grant and revoke every token minted for the workspace."""
+        with locks.held(self.cfg.lock_dir, name):
+            ws = self.require(name)
+            if kind == "github":
+                value = self._full_repo(value)
+            kept = [g for g in ws.grants if (g.get("kind"), g.get("value")) != (kind, value)]
+            if len(kept) == len(ws.grants):
+                raise OrchardError(f"{name} has no {kind} grant for {value!r}")
+            self.log(f"revoking {kind} {value} from {name}")
+            ws = self._set_grants(ws, kept)
+            self._revoke_tokens(name)
+            return ws
+
+    def token(self, name: str, kind: str = "github") -> dict[str, Any]:
+        """A fresh (or cached, unexpired) token for the workspace, limited to
+        its active grants of that kind."""
+        if kind != "github":
+            raise OrchardError(f"unknown token kind {kind!r}")
+        if self.github is None:
+            raise OrchardError("GitHub tokens are not configured on this host (services.orchard.github)")
+        ws = self.require(name)
+        grants = [g for g in active_grants(ws.grants, self.now()) if g.get("kind") == "github"]
+        if not grants:
+            raise OrchardError(f"{name} has no active github grants")
+        repos = sorted({g["value"] for g in grants})
+        # Per-grant permissions narrow the token; a token has one permission
+        # set for all its repositories, so grants that name any are unioned
+        # (write beats read) and a grant that names none means the App's full set.
+        permissions: dict[str, str] | None = None
+        if all(g.get("permissions") for g in grants):
+            permissions = {}
+            for g in grants:
+                for k, v in g["permissions"].items():
+                    permissions[k] = "write" if "write" in (v, permissions.get(k)) else v
+        tok = self.github.token(name, repos, permissions)
+        return {**tok, "workspace": name}
+
+    def _revoke_tokens(self, name: str) -> None:
+        if self.github is None:
+            return
+        try:
+            n = self.github.revoke(name)
+            if n:
+                self.log(f"revoked {n} token(s) of {name}")
+        except OrchardError as e:
+            self.log(f"warning: {e}")
+
+    def repo_allowed(self, name: str) -> bool:
+        """For a `name.repo` lookup: does the App reach that repository? True
+        when the name has no repo part, when GitHub is not configured, or
+        when GitHub cannot be asked and nothing is cached."""
+        rep = names.repo(name)
+        if not rep or self.github is None or not self.cfg.github_owner:
+            return True
+        repos = self.github.installed_repos()
+        if repos is None:
+            return True
+        return f"{self.cfg.github_owner}/{rep}".lower() in {r.lower() for r in repos}
+
+    # -- secrets, shared volume, clone ---------------------------------------
+
+    def _runtime_dir_ready(self, inst: str) -> bool:
+        """Wait for logind to mount the workspace user's /run/user/<uid>
+        (the lingering user's session starts with the container)."""
+        path = f"/run/user/{self.cfg.uid}"
+        for attempt in range(RUNTIME_DIR_TRIES):
+            proc = self.inc.exec(inst, "mountpoint", "-q", path, check=False)
+            if proc.returncode == 0:
+                return True
+            if attempt == 0:
+                self.log(f"waiting for {path} in {names.display(inst)}")
+            self.sleep(RUNTIME_DIR_WAIT)
+        return False
+
+    def _push_secrets(self, ws: Workspace) -> None:
+        """Copy the cached secrets env file into the workspace's tmpfs."""
+        if not self.secrets.configured:
+            return
+        keys, age = self.secrets.cached()
+        if age is None:
+            if not self._warned_no_cache:
+                self.log("warning: no secrets cached yet (`dev secrets refresh`); none pushed")
+                self._warned_no_cache = True
+            return
+        cfg = self.cfg
+        if not self._runtime_dir_ready(ws.instance):
+            self.log(f"warning: /run/user/{cfg.uid} never appeared in {ws.name}; secrets not pushed")
+            return
+        dst = f"{cfg.secrets_path()}/{ENV_FILE}"
+        try:
+            self.inc.file_push(self.secrets.env_file(), ws.instance, dst, uid=cfg.uid, gid=cfg.gid, mode="0600")
+            self.inc.exec(ws.instance, "chown", f"{cfg.uid}:{cfg.gid}", cfg.secrets_path(), check=False)
+            self.inc.exec(ws.instance, "chmod", "0700", cfg.secrets_path(), check=False)
+        except IncusError as e:
+            self.log(f"warning: could not push secrets into {ws.name}: {e}")
+
+    def _ensure_logins_volume(self) -> str | None:
+        cfg = self.cfg
+        if not cfg.logins_volume:
+            return None
+        if self.inc.volume(cfg.pool, cfg.logins_volume) is None:
+            self.log(f"creating shared volume {cfg.logins_volume} ({cfg.logins_size})")
+            self.inc.volume_create(
+                cfg.pool, cfg.logins_volume,
+                size=cfg.logins_size,
+                **{
+                    "initial.uid": str(cfg.uid),
+                    "initial.gid": str(cfg.gid),
+                    "initial.mode": "0700",
+                    "security.shifted": "true",
+                },
+            )
+        return cfg.logins_volume
+
+    def _attach_logins(self, inst: str) -> None:
+        """Mount the shared volume (agent logins) into the instance if it is
+        not there yet; Incus hot-plugs disk devices into running containers."""
+        vol = self._ensure_logins_volume()
+        if vol is None:
+            return
+        devices = (self.inc.instance(inst) or {}).get("devices") or {}
+        if LOGINS_DEVICE in devices:
+            return
+        try:
+            self.inc.device_add(inst, LOGINS_DEVICE, "disk", pool=self.cfg.pool, source=vol, path=self.cfg.logins_path())
+        except IncusError as e:
+            self.log(f"warning: could not attach {vol} to {names.display(inst)}: {e}")
+
+    def _clone(self, ws: Workspace, full_repo: str) -> None:
+        """Clone `owner/repo` into ~/work/<repo> with a token minted from the
+        workspace's grants. Never fatal: the result goes on the manifest."""
+        cfg = self.cfg
+        target = f"{cfg.work_path()}/{full_repo.split('/', 1)[1]}"
+        if self.github is None:
+            self._note_clone(ws, "skipped: GitHub tokens are not configured")
+            return
+        if self.inc.exec(ws.instance, "test", "-e", target, check=False).returncode == 0:
+            self._note_clone(ws, f"skipped: {target} exists")
+            return
+        if not self._runtime_dir_ready(ws.instance):
+            self._note_clone(ws, f"failed: /run/user/{cfg.uid} never appeared")
+            return
+        creds = f"{cfg.secrets_path()}/{GIT_CREDENTIALS}"
+        tmp = tempfile.mkdtemp(prefix="orchard-clone-")
+        try:
+            tok = self.token(ws.name)
+            local = os.path.join(tmp, "creds")
+            with open(local, "w") as f:
+                f.write(f"https://x-access-token:{tok['token']}@github.com\n")
+            os.chmod(local, 0o600)
+            self.inc.file_push(local, ws.instance, creds, uid=cfg.uid, gid=cfg.gid, mode="0600")
+            self.log(f"cloning {full_repo} into {target}")
+            proc = self.inc.exec(
+                ws.instance, "git", "-c", f"credential.helper=store --file={creds}",
+                "clone", "--quiet", f"https://github.com/{full_repo}", target,
+                check=False, user=cfg.uid, group=cfg.gid, env={"HOME": f"/home/{cfg.user}"},
+            )
+            if proc.returncode == 0:
+                self._note_clone(ws, "ok")
+            else:
+                self._note_clone(ws, f"failed: {proc.stderr.strip().splitlines()[-1] if proc.stderr.strip() else proc.returncode}")
+        except OrchardError as e:
+            self._note_clone(ws, f"failed: {e}")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+            try:
+                self.inc.exec(ws.instance, "rm", "-f", creds, check=False)
+            except IncusError:
+                pass
+
+    def _note_clone(self, ws: Workspace, result: str) -> None:
+        self.log(f"clone {ws.name}: {result}")
+        try:
+            self.inc.config_set(ws.instance, {KEY + "clone": result})
+        except IncusError:
+            pass
+        ws.clone = result
 
     def _push_client(self, ws: Workspace) -> None:
         cfg = self.cfg
@@ -853,7 +1185,7 @@ class Manager:
             client = os.path.join(tmp, "dev")
             with open(client, "w") as f:
                 f.write(SELF_CLIENT.format(host=cfg.self_host))
-            self.inc.file_push(client, ws.name, f"/home/{cfg.user}/.local/bin/dev", uid=cfg.uid, gid=cfg.gid, mode="0755")
+            self.inc.file_push(client, ws.instance, f"/home/{cfg.user}/.local/bin/dev", uid=cfg.uid, gid=cfg.gid, mode="0755")
         except IncusError as e:
             self.log(f"warning: could not update the dev client in {ws.name}: {e}")
         finally:
@@ -891,12 +1223,12 @@ class Manager:
             with open(client, "w") as f:
                 f.write(SELF_CLIENT.format(host=cfg.self_host))
             home = f"/home/{cfg.user}"
-            self.inc.file_push(key, ws.name, f"{home}/.orchard/self.key", uid=cfg.uid, gid=cfg.gid, mode="0600")
-            self.inc.file_push(known, ws.name, f"{home}/.orchard/known_hosts", uid=cfg.uid, gid=cfg.gid, mode="0644")
-            self.inc.file_push(client, ws.name, f"{home}/.local/bin/dev", uid=cfg.uid, gid=cfg.gid, mode="0755")
+            self.inc.file_push(key, ws.instance, f"{home}/.orchard/self.key", uid=cfg.uid, gid=cfg.gid, mode="0600")
+            self.inc.file_push(known, ws.instance, f"{home}/.orchard/known_hosts", uid=cfg.uid, gid=cfg.gid, mode="0644")
+            self.inc.file_push(client, ws.instance, f"{home}/.local/bin/dev", uid=cfg.uid, gid=cfg.gid, mode="0755")
             # --create-dirs makes the parents as root; hand them to the user.
-            self.inc.exec(ws.name, "chown", f"{cfg.uid}:{cfg.gid}", f"{home}/.orchard", f"{home}/.local/bin", check=False)
-            self.inc.config_set(ws.name, {KEY + "selfkey": pub})
+            self.inc.exec(ws.instance, "chown", f"{cfg.uid}:{cfg.gid}", f"{home}/.orchard", f"{home}/.local/bin", check=False)
+            self.inc.config_set(ws.instance, {KEY + "selfkey": pub})
             ws.selfkey = pub
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
@@ -922,6 +1254,7 @@ class Manager:
         env = {
             **os.environ,
             "ORCHARD_NAME": ws.name,
+            "ORCHARD_INSTANCE": ws.instance,
             "ORCHARD_IP": ws.ip or "",
             "ORCHARD_PARENT": ws.parent or "",
             "ORCHARD_USER": self.cfg.user,
