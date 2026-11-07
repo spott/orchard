@@ -159,10 +159,12 @@ in
       };
       owner = lib.mkOption {
         type = lib.types.str;
+        default = "";
         description = ''
           GitHub account the App is installed on. `name.repo` workspaces
           clone and are granted `<owner>/<repo>`; a bare `dev grant NAME repo`
-          means the same.
+          means the same. Read even with `enable = false` (grants can be
+          recorded before tokens are minted); empty = `name.repo` seeds no grant.
         '';
       };
       apiUrl = lib.mkOption {
