@@ -162,6 +162,11 @@ def _nic(inst: dict[str, Any]) -> dict[str, Any]:
     return {}
 
 
+def _fresh_mac() -> str:
+    """A random locally administered MAC (02:...), outside Incus's own 10:66:6a range."""
+    return "02:" + ":".join(f"{b:02x}" for b in os.urandom(5))
+
+
 def from_instance(inst: dict[str, Any]) -> Workspace:
     cfg = inst.get("config") or {}
     work = (inst.get("devices") or {}).get(WORK_DEVICE) or {}
@@ -327,6 +332,10 @@ class Manager:
             if ws.running:
                 self.log(f"stopping {name}")
                 self.inc.stop(name, force=True)
+            for old in self.old_instances(name):
+                self.log(f"deleting parked {old}")
+                self.inc.delete(old, force=True)
+                removed.append(old)
             self.log(f"deleting {name}")
             self.inc.delete(name, force=True)
             vol = ws.volume or names.volume(name)
@@ -645,17 +654,23 @@ class Manager:
             return removed
 
     def _release_nic(self, name: str, addr: str | None, hwaddr: str | None) -> None:
-        """Take the reserved address and the MAC off a parked instance so
-        another instance may hold them (Incus validates both per network).
-        The instance gets a fresh MAC if it is ever started again."""
+        """Take the reserved address and the MAC off an instance being parked
+        so another instance may hold them (Incus validates both per network).
+        The MAC is *replaced*, not unset: a device update is what makes Incus
+        rewrite the instance's dnsmasq host entry, and dnsmasq honours the
+        last entry it read for a MAC, so a stale one would steal the lease."""
         inst = self.inc.instance(name) or {}
         nic = (inst.get("devices") or {}).get(NIC_DEVICE) or {}
+        props: dict[str, str] = {}
+        if hwaddr:
+            props["hwaddr"] = _fresh_mac()
+        if props:
+            if NIC_DEVICE in (inst.get("devices") or {}):
+                self.inc.device_set(name, NIC_DEVICE, **props)
+            else:
+                self.inc.device_override(name, NIC_DEVICE, **props)
         if addr and nic.get("ipv4.address"):
             self.inc.device_unset(name, NIC_DEVICE, "ipv4.address")
-        if hwaddr and nic.get("hwaddr"):
-            self.inc.device_unset(name, NIC_DEVICE, "hwaddr")
-        if hwaddr and (inst.get("config") or {}).get(f"volatile.{NIC_DEVICE}.hwaddr") == hwaddr:
-            self.inc.config_unset(name, f"volatile.{NIC_DEVICE}.hwaddr")
 
     def _claim_nic(self, name: str, addr: str | None, hwaddr: str | None) -> None:
         """Pin the address and MAC on the instance's NIC: `set` when the NIC is

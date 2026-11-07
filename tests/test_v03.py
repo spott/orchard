@@ -133,7 +133,8 @@ def test_rebase_keeps_volume_address_metadata_and_identity(mgr, inc, cfg):
     # ... and the MAC, so dnsmasq's lease for that address follows the workspace;
     # the parked instance drops it (Incus validates MACs per network too).
     assert inc.inst["foo"]["devices"]["eth0"]["hwaddr"] == "10:66:6a:00:00:01"
-    assert "hwaddr" not in inc.inst[old]["devices"]["eth0"] and "volatile.eth0.hwaddr" not in inc.inst[old]["config"]
+    parked_mac = inc.inst[old]["devices"]["eth0"]["hwaddr"]
+    assert parked_mac.startswith("02:") and parked_mac != "10:66:6a:00:00:01"
     # Identity moved: host keys, machine-id, self key; dev client re-pushed.
     assert inc.files["foo"]["/etc/ssh/ssh_host_ed25519_key"] == "PRIVATE\n"
     assert inc.files["foo"]["/etc/machine-id"] == "0123456789abcdef\n"
@@ -217,7 +218,7 @@ def test_rebase_rollback_and_prune(mgr, inc, cfg):
     assert ws.address == created.address and "ipv4.address" not in inc.inst[parked]["devices"]["eth0"]
     # Address and MAC travel back; the parked (rebased) instance holds neither.
     assert inc.inst["foo"]["devices"]["eth0"]["hwaddr"] == "10:66:6a:00:00:01"
-    assert "hwaddr" not in inc.inst[parked]["devices"]["eth0"]
+    assert inc.inst[parked]["devices"]["eth0"]["hwaddr"].startswith("02:")
     assert parked == old + "-2"  # same frozen second as the rebase: counter, no collision
     assert inc.inst[parked]["config"][KEY + "old-of"] == "foo"
     assert _calls(inc, "volume_snapshot_restore") == [("volume_snapshot_restore", "default", "ws-foo", "pre-rebase-20261101t120000z")]
@@ -228,6 +229,15 @@ def test_rebase_rollback_and_prune(mgr, inc, cfg):
     assert mgr.old_instances("foo") == [] and inc.snaps["ws-foo"] == []
     with pytest.raises(NoPrevious):
         mgr.rebase_rollback("foo")
+
+
+def test_rm_takes_the_parked_instances_with_it(mgr, inc):
+    mgr.create("foo")
+    inc.images["next"] = NEW
+    _, old = mgr.rebase("foo", "next")
+    removed = mgr.rm("foo", now=True)
+    assert removed == [old, "foo"]
+    assert "foo" not in inc.inst and old not in inc.inst and mgr.old_instances("foo") == []
 
 
 def test_volume_snapshots_strip_the_volume_prefix(monkeypatch):
