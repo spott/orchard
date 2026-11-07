@@ -126,6 +126,9 @@ def test_rebase_keeps_volume_address_metadata_and_identity(mgr, inc, cfg):
     assert parked[KEY + "managed"] == "false" and parked[KEY + "old-of"] == "foo"
     assert "work" not in inc.inst[old]["devices"] and inc.inst["foo"]["devices"]["work"]["source"] == "ws-foo"
     assert inc.inst[old]["status"] == "Stopped"
+    # The address moved too: Incus allows one static address per network.
+    assert "ipv4.address" not in inc.inst[old]["devices"]["eth0"]
+    assert inc.inst["foo"]["devices"]["eth0"]["ipv4.address"] == ws.address
     # Identity moved: host keys, machine-id, self key; dev client re-pushed.
     assert inc.files["foo"]["/etc/ssh/ssh_host_ed25519_key"] == "PRIVATE\n"
     assert inc.files["foo"]["/etc/machine-id"] == "0123456789abcdef\n"
@@ -153,7 +156,8 @@ def test_rebase_unknown_image_changes_nothing(mgr, inc):
     assert inc.calls == []
 
 
-def test_rebase_failure_restores_the_old_instance(mgr, inc):
+def test_rebase_failure_restores_the_old_instance(mgr, inc, cfg):
+    cfg.address_start, cfg.address_end = "10.100.0.100", "10.100.0.110"
     mgr.create("foo")
     inc.images["next"] = NEW
     inc.fail_on.add("init")
@@ -163,8 +167,9 @@ def test_rebase_failure_restores_the_old_instance(mgr, inc):
     assert ws.fingerprint == inc.images["workspace"] and ws.volume == "ws-foo"
     assert inc.inst["foo"]["config"].get(KEY + "managed") == "true" and KEY + "old-of" not in inc.inst["foo"]["config"]
     assert mgr.old_instances("foo") == []
-    # The volume is attached to the restored instance (it was detached after the rename).
+    # The volume and the address are back on the restored instance.
     assert inc.inst["foo"]["devices"]["work"]["source"] == "ws-foo"
+    assert inc.inst["foo"]["devices"]["eth0"]["ipv4.address"] == ws.address
 
 
 def test_rebase_pulls_identity_while_running_and_waits_out_a_busy_rename(mgr, inc):
@@ -194,14 +199,16 @@ def test_rebase_gives_up_on_a_rename_that_stays_busy(mgr, inc):
     assert inc.inst["foo"]["devices"]["work"]["source"] == "ws-foo" and mgr.old_instances("foo") == []
 
 
-def test_rebase_rollback_and_prune(mgr, inc):
-    mgr.create("foo")
+def test_rebase_rollback_and_prune(mgr, inc, cfg):
+    cfg.address_start, cfg.address_end = "10.100.0.100", "10.100.0.110"
+    created = mgr.create("foo")
     inc.images["next"] = NEW
     _, old = mgr.rebase("foo", "next")
     inc.calls.clear()
 
     ws, parked = mgr.rebase_rollback("foo", restore=True)
     assert ws.running and ws.fingerprint == inc.images["workspace"] and ws.volume == "ws-foo"
+    assert ws.address == created.address and "ipv4.address" not in inc.inst[parked]["devices"]["eth0"]
     assert parked == old + "-2"  # same frozen second as the rebase: counter, no collision
     assert inc.inst[parked]["config"][KEY + "old-of"] == "foo"
     assert _calls(inc, "volume_snapshot_restore") == [("volume_snapshot_restore", "default", "ws-foo", "pre-rebase-20261101t120000z")]

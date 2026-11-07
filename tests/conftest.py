@@ -113,6 +113,9 @@ class FakeIncus(Incus):
     def device_override(self, name, device, **props):
         self._maybe_fail("device_override")
         self.calls.append(("device_override", name, device, dict(props)))
+        if device in self.inst[name]["devices"]:
+            # Like Incus: override copies a *profile* device; an instance-level one needs `set`.
+            raise IncusError([self.binary, "config", "device", "override", name, device], 1, "Error: The device already exists")
         dev = self.inst[name]["devices"].setdefault(device, {"type": "nic", "network": "incusbr0"})
         dev.update(props)
         # Like Incus: a reserved address is what the next start leases.
@@ -124,6 +127,10 @@ class FakeIncus(Incus):
     def device_set(self, name, device, **props):
         self.calls.append(("device_set", name, device, dict(props)))
         self.inst[name]["devices"][device].update(props)
+
+    def device_unset(self, name, device, key):
+        self.calls.append(("device_unset", name, device, key))
+        self.inst[name]["devices"][device].pop(key, None)
 
     def device_remove(self, name, device):
         self.calls.append(("device_remove", name, device))
