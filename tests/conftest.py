@@ -28,6 +28,7 @@ class FakeIncus(Incus):
         self.snaps: dict[str, list[str]] = {}
         self.exec_out: dict[str, tuple[int, str, str]] = {}
         self.execs: list[tuple[Any, ...]] = []
+        self.busy_renames = 0  # renames that fail with EBUSY before one succeeds
 
     def _maybe_fail(self, op: str) -> None:
         if op in self.fail_on:
@@ -79,6 +80,9 @@ class FakeIncus(Incus):
 
     def rename(self, old, new):
         self.calls.append(("rename", old, new))
+        if self.busy_renames > 0:
+            self.busy_renames -= 1
+            raise IncusError([self.binary, "rename", old, new], 1, f"Error: Rename instance: rename {old} {new}: device or resource busy")
         self.inst[new] = self.inst.pop(old)
         self.inst[new]["name"] = new
         if old in self.files:
@@ -143,6 +147,7 @@ class FakeIncus(Incus):
         self.files.setdefault(name, {})[dst] = content
 
     def file_pull(self, name, src, dst, check=True):
+        self.calls.append(("file_pull", name, src))
         content = self.files.get(name, {}).get(src)
         if content is None:
             if check:
