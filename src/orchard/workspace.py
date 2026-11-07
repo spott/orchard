@@ -548,6 +548,10 @@ class Manager:
                 inst = self.inc.instance(name) or {}
                 meta = {k: v for k, v in (inst.get("config") or {}).items() if k.startswith(KEY)}
                 meta[KEY + "rebased"] = self.now().isoformat(timespec="seconds")
+                # The MAC is identity too: dnsmasq hands the reserved address
+                # to the MAC holding its lease, and a force-stopped instance
+                # (rollback) never releases one.
+                hwaddr = _nic(inst).get("hwaddr") or (inst.get("config") or {}).get(f"volatile.{NIC_DEVICE}.hwaddr")
                 old = self._free_old_name(name, stamp)
                 self.log(f"keeping the old instance as {old}")
                 # Rename first, with the volume still attached: until this
@@ -563,8 +567,9 @@ class Manager:
                     self.log(f"creating {name} from image {target[:12]}")
                     self.inc.init(target, name, cfg.profiles, meta)
                     self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
-                    if ws.address:
-                        self.inc.device_override(name, NIC_DEVICE, **{"ipv4.address": ws.address})
+                    nic = {k: v for k, v in (("ipv4.address", ws.address), ("hwaddr", hwaddr)) if v}
+                    if nic:
+                        self.inc.device_override(name, NIC_DEVICE, **nic)
                     self._push_identity(name, identity)
                 except OrchardError:
                     self.log(f"rebase failed, putting {old} back as {name}")

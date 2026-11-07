@@ -109,6 +109,7 @@ def test_rebase_keeps_volume_address_metadata_and_identity(mgr, inc, cfg):
     cfg.address_start, cfg.address_end = "10.100.0.100", "10.100.0.110"
     ws = mgr.create("foo", repo="github:spott/foo")
     inc.inst["foo"]["config"][KEY + "selfkey"] = "ssh-ed25519 AAAASELF orchard:foo"
+    inc.inst["foo"]["config"]["volatile.eth0.hwaddr"] = "10:66:6a:00:00:01"
     _seed_identity(inc, "foo")
     inc.images["workspace-next"] = NEW
     inc.calls.clear()
@@ -129,6 +130,8 @@ def test_rebase_keeps_volume_address_metadata_and_identity(mgr, inc, cfg):
     # The address moved too: Incus allows one static address per network.
     assert "ipv4.address" not in inc.inst[old]["devices"]["eth0"]
     assert inc.inst["foo"]["devices"]["eth0"]["ipv4.address"] == ws.address
+    # ... and the MAC, so dnsmasq's lease for that address follows the workspace.
+    assert inc.inst["foo"]["devices"]["eth0"]["hwaddr"] == "10:66:6a:00:00:01"
     # Identity moved: host keys, machine-id, self key; dev client re-pushed.
     assert inc.files["foo"]["/etc/ssh/ssh_host_ed25519_key"] == "PRIVATE\n"
     assert inc.files["foo"]["/etc/machine-id"] == "0123456789abcdef\n"
@@ -219,6 +222,14 @@ def test_rebase_rollback_and_prune(mgr, inc, cfg):
     assert mgr.old_instances("foo") == [] and inc.snaps["ws-foo"] == []
     with pytest.raises(NoPrevious):
         mgr.rebase_rollback("foo")
+
+
+def test_volume_snapshots_strip_the_volume_prefix(monkeypatch):
+    from orchard.incus import Incus
+
+    real = Incus("incus")
+    monkeypatch.setattr(real, "json", lambda *a: [{"name": "ws-foo/pre-rebase-1"}, {"name": "ws-foo/other"}])
+    assert real.volume_snapshots("default", "ws-foo") == ["pre-rebase-1", "other"]
 
 
 # -- update -------------------------------------------------------------------

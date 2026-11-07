@@ -164,7 +164,8 @@ class Incus:
         self.run("storage", "volume", "set", pool, name, *[f"{k}={v}" for k, v in config.items()])
 
     def volume_snapshots(self, pool: str, name: str) -> list[str]:
-        return [s["name"] for s in self.json("storage", "volume", "snapshot", "list", pool, name)]
+        # Incus lists them as "<volume>/<snapshot>".
+        return [s["name"].split("/", 1)[-1] for s in self.json("storage", "volume", "snapshot", "list", pool, name)]
 
     def volume_snapshot(self, pool: str, name: str, snapshot: str) -> None:
         self.run("storage", "volume", "snapshot", "create", pool, name, snapshot)
