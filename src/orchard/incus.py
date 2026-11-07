@@ -89,6 +89,9 @@ class Incus:
     def device_set(self, name: str, device: str, **props: str) -> None:
         self.run("config", "device", "set", name, device, *[f"{k}={v}" for k, v in props.items()])
 
+    def device_unset(self, name: str, device: str, key: str) -> None:
+        self.run("config", "device", "unset", name, device, key)
+
     def device_remove(self, name: str, device: str) -> None:
         self.run("config", "device", "remove", name, device)
 

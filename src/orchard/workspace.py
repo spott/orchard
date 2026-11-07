@@ -556,6 +556,10 @@ class Manager:
                 try:
                     self.inc.config_set(old, {KEY + "managed": "false", KEY + "old-of": name})
                     self.inc.device_remove(old, WORK_DEVICE)
+                    if ws.address:
+                        # Incus refuses one static address on two NICs, even
+                        # with the other instance stopped: the parked one lets go.
+                        self.inc.device_unset(old, NIC_DEVICE, "ipv4.address")
                     self.log(f"creating {name} from image {target[:12]}")
                     self.inc.init(target, name, cfg.profiles, meta)
                     self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
@@ -573,6 +577,8 @@ class Manager:
                     self.inc.config_unset(name, KEY + "old-of")
                     if WORK_DEVICE not in ((self.inc.instance(name) or {}).get("devices") or {}):
                         self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+                    if ws.address:
+                        self._set_address(name, ws.address)
                     raise
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -598,7 +604,10 @@ class Manager:
                 self.log(f"stopping {name}")
                 self.inc.stop(name, force=True)
             parked = self._free_old_name(name, stamp)
+            addr = cur.address
             self.inc.device_remove(name, WORK_DEVICE)
+            if addr:
+                self.inc.device_unset(name, NIC_DEVICE, "ipv4.address")
             self._rename_settled(name, parked)
             self.inc.config_set(parked, {KEY + "managed": "false", KEY + "old-of": name})
             self.log(f"restoring {previous} as {name} (the rebased instance is kept as {parked})")
@@ -606,6 +615,8 @@ class Manager:
             self.inc.config_set(name, {KEY + "managed": "true"})
             self.inc.config_unset(name, KEY + "old-of")
             self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+            if addr:
+                self._set_address(name, addr)
             if restore:
                 snaps = sorted(s for s in self.inc.volume_snapshots(cfg.pool, vol) if s.startswith(SNAPSHOT_PREFIX))
                 if snaps:
@@ -631,6 +642,15 @@ class Manager:
                     self.inc.volume_snapshot_delete(cfg.pool, vol, snap)
                     removed.append(f"{vol}/{snap}")
             return removed
+
+    def _set_address(self, name: str, addr: str) -> None:
+        """Pin `addr` on the instance's NIC: `set` when the NIC is already an
+        instance-level device, `override` when it still comes from the profile."""
+        devices = (self.inc.instance(name) or {}).get("devices") or {}
+        if NIC_DEVICE in devices:
+            self.inc.device_set(name, NIC_DEVICE, **{"ipv4.address": addr})
+        else:
+            self.inc.device_override(name, NIC_DEVICE, **{"ipv4.address": addr})
 
     def _rename_settled(self, old: str, new: str) -> None:
         """`incus rename` that waits out the host-side mount Incus leaves
