@@ -16,7 +16,7 @@ Orchard is a small Python package (standard library only) plus a NixOS module:
 
 | Piece | What |
 |---|---|
-| `dev` | the operator CLI: `create`, `ls`, `status`, `start`, `stop`, `restart`, `rename`, `rm`, `gc`, `proxy` |
+| `dev` | the operator CLI: `create`, `ls`, `status`, `start`, `stop`, `restart`, `rename`, `rm`, `gc`, `fork`, `rebase`, `update`, `grant`, `revoke`, `token`, `secrets`, `proxy` |
 | `orchard-front-door` | the sshd `ForceCommand` for the jump user; speaks `proxy <host>` and `dev <args>` |
 | `orchard-dns` | the wake resolver: serves the workspace zone, starts or creates what is looked up |
 | `orchard-authorized-keys` | sshd `AuthorizedKeysCommand`: the workspaces' self-service keys |
@@ -26,8 +26,17 @@ Orchard is a small Python package (standard library only) plus a NixOS module:
 
 - A **workspace is an Incus instance** with the workspace's name. Its only
   metadata are `user.orchard.*` config keys on the instance (`managed`,
-  `created`, `repo`, `agent`, `parent`). There is no database; `dev ls` is a
-  filtered `incus list`.
+  `created`, `repo`, `agent`, `parent`, `grants`, `clone`). There is no
+  database; `dev ls` is a filtered `incus list`.
+- A workspace name is **`name` or `name.repo`**. The repo part matters
+  only at create: `blah.iac` clones `<owner>/iac` into `~/work/iac` and
+  seeds the workspace's grants with that repository (see below). From then
+  on `blah.iac` is just its name: what it may reach is its grant list,
+  which may drift from the name (a `blah.iac` can lose `iac` and gain
+  `orchard`; renaming is optional). Incus instance names cannot contain
+  dots, so the instance and volume are `blah--iac` and `ws-blah--iac`;
+  `--` is therefore reserved inside a name. Forks of `blah.iac` are
+  `blah-N.iac`.
 - Each workspace has a **custom storage volume `ws-<name>`** mounted at
   `~/work` inside the container (idmapped, owned by the workspace user). The
   root filesystem is disposable and comes from the image; the volume is the
@@ -62,6 +71,67 @@ Orchard is a small Python package (standard library only) plus a NixOS module:
   2 usage. A failed `create` removes what it made; a volume it adopted is
   never deleted; a failed `fork` drops its copy; a failed `rebase` puts the
   old instance back.
+
+## Grants and GitHub tokens
+
+What a workspace may reach is a list of **grants** on its manifest
+(`user.orchard.grants`, JSON: kind, value, optional permissions and expiry,
+who granted it and when). Grants are data, never derived from the name at
+request time: a workspace that renames itself to `iac` does not become iac.
+Forks inherit the parent's grants. Today's only kind is `github`.
+
+```
+dev grant blah.iac orchard                      # + spott/orchard (owner from config)
+dev grant blah.iac spott/mcps --for 2h          # expires on its own
+dev grant blah.iac iac --permissions contents=read
+dev revoke blah.iac orchard                     # and revokes the workspace's live tokens
+dev ls                                          # GRANTS column
+```
+
+With `services.orchard.github` the host holds a **GitHub App**'s private
+key and mints **installation tokens** per workspace, narrowed to the
+repositories in its active grants (and to the union of their permissions
+when every grant names some; otherwise the App's full set). Tokens live one
+hour, are cached on the host until shortly before they expire, and are
+revoked whenever the grant list changes or the workspace is removed:
+
+```
+dev token github blah.iac           # operator, on the host
+dev token github                    # from inside: this workspace only
+dev token github --git              # git credential-helper output
+```
+
+The image's git credential helper and `gh` wrapper call the last form, so a
+grant made from the phone applies within the hour and a revoke at once.
+Pushes and pull requests appear as the App (`<app>[bot]`), a different
+actor than the operator. Mint requests are signed with `openssl dgst` (RS256);
+the key never enters a workspace.
+
+A lookup of `name.repo` for a repository the App does not reach answers
+NXDOMAIN and creates nothing (the installation's repository list is cached
+for an hour); a typo in the name part still creates, and `gc` reaps it.
+
+## Secrets at start
+
+`services.orchard.secrets.env` maps environment variables to `op://`
+references. `dev secrets refresh` (a timer, every 6 h by default) reads them
+with a read-only 1Password service account into a cache on the host; every
+start then pushes the cache into the workspace's `/run/user/<uid>/orchard/env`
+(a tmpfs, mode 0600, shell-quoted `KEY=value` lines for the image's shell to
+source). Starts cost no 1Password requests, a stopped workspace holds no
+secrets, and nothing lands on a volume. `dev secrets push [NAME...]`
+re-pushes into running workspaces; `dev secrets ls` shows the cached keys
+and the cache age (never values).
+
+## Shared logins volume
+
+`services.orchard.logins.enable` creates one custom volume (`logins`) and
+mounts it read-write into every workspace at `~/.orchard/logins`, idmapped
+to the workspace user. It is for state all workspaces should share, such as
+agents' OAuth login files: symlink `~/.codex/auth.json` and friends into it
+from the image, and a refresh or re-login in any workspace is seen by all.
+Existing workspaces get it on their next `dev start` (Incus hot-plugs the
+disk); `rm`, `fork` and `rebase` never touch it.
 
 ## Image contract
 
@@ -121,6 +191,7 @@ dev rename bar        # stop, rename instance and volume, start again; reconnect
 dev stop
 dev rm                # volume kept for the grace period as trash-<name>-<stamp>
 dev ls                # read-only view of the others
+dev token github      # a token limited to this workspace's grants
 ```
 
 Who a session is comes only from the key sshd reports as having
@@ -175,7 +246,19 @@ ssh dev@orchard.example.com dev rm old-experiment
     pool = "default";
     volumeSize = "50GiB";
     rmGraceDays = 7;
-    # hooks.onCreate = pkgs.writeShellScript "inject-secrets" "...";
+    github = {                    # per-workspace tokens
+      enable = true;
+      appId = 1234;
+      privateKeyFile = "/run/keys/orchard-github-app.pem";
+      owner = "spott";
+    };
+    secrets = {                   # into every workspace's tmpfs at start
+      env.CLAUDE_CODE_OAUTH_TOKEN = "op://dev/claude/credential";
+      env.OBSIDIAN_MCP_TOKEN = "op://dev/obsidian-mcp/bearer";
+      tokenFile = "/run/keys/orchard-op-token";
+    };
+    logins.enable = true;         # one shared volume for agent logins
+    # hooks.onCreate = pkgs.writeShellScript "site-specific" "...";
   };
 }
 ```
@@ -187,10 +270,11 @@ All options have defaults; see `nix/module.nix`. The module writes
 ## Hooks
 
 `hooks.onCreate` is an executable run on the host after a new workspace is
-reachable, with `ORCHARD_NAME`, `ORCHARD_IP`, `ORCHARD_PARENT`,
-`ORCHARD_USER` and `ORCHARD_EVENT` in its environment and the output going
-to the caller's stderr. Secrets injection, repo cloning and anything
-site-specific belongs there. A non-zero exit is logged, not fatal.
+reachable (and after its secrets and clone), with `ORCHARD_NAME`,
+`ORCHARD_INSTANCE`, `ORCHARD_IP`, `ORCHARD_PARENT`, `ORCHARD_USER` and
+`ORCHARD_EVENT` in its environment and the output going to the caller's
+stderr. Anything site-specific that the options above do not cover belongs
+there. A non-zero exit is logged, not fatal.
 
 ## Development
 
@@ -207,6 +291,8 @@ Incus. The relay has its own socketpair tests.
 
 - nightly `incus storage volume export` backups with a restore test
 - an MCP server over the same library
+- grant requests from inside a workspace, approved from a phone
+- per-workspace keys for the MCP servers the image points at (today: shared bearers in `secrets.env`)
 
 ## License
 

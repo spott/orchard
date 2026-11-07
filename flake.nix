@@ -12,7 +12,7 @@
       packages = forAll (pkgs: rec {
         orchard = pkgs.python3Packages.buildPythonApplication {
           pname = "orchard";
-          version = "0.3.5";
+          version = "0.4.0";
           pyproject = true;
           src = ./.;
           build-system = [ pkgs.python3Packages.setuptools ];
