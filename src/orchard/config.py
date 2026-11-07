@@ -10,6 +10,10 @@ from dataclasses import dataclass, field
 from . import OrchardError
 
 DEFAULT_PATH = "/etc/orchard/config.json"
+# Repository permissions for grants that name none: enough to push, open
+# pull requests and edit workflows; nothing administrative.
+DEFAULT_PERMISSIONS = {"contents": "write", "pull_requests": "write", "workflows": "write", "metadata": "read"}
+
 ENV_VAR = "ORCHARD_CONFIG"
 
 
@@ -73,6 +77,9 @@ class Config:
     github_key_file: str = ""
     github_owner: str = ""
     github_api: str = "https://api.github.com"
+    # What a grant means when it names no permissions (a `name.repo`
+    # create, a bare `dev grant`). Empty = the App's full set.
+    github_default_permissions: dict[str, str] = field(default_factory=lambda: dict(DEFAULT_PERMISSIONS))
     openssl: str = "openssl"
     # Secrets pushed into every workspace's tmpfs at start: environment
     # variable -> `op://` reference, read with the 1Password service account

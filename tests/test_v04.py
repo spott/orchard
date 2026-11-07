@@ -117,7 +117,8 @@ def test_name_repo_seeds_a_grant_and_plain_names_get_none(gmgr):
     assert gmgr.create("foo").grants == []
 
 
-def test_create_repo_flag_grants_and_urls_are_only_recorded(gmgr):
+def test_create_repo_flag_grants_and_urls_are_only_recorded(gmgr, gh):
+    gh.repos.append("other/thing")  # before the repo list is fetched and cached
     assert gmgr.create("a", repo="orchard").repos() == ["spott/orchard"]
     assert gmgr.create("b", repo="other/thing").repos() == ["other/thing"]
     ws = gmgr.create("c", repo="https://example.com/x.git")
@@ -152,15 +153,18 @@ def test_token_is_narrowed_to_the_grants_cached_and_revoked(gmgr, gh, inc):
     gmgr.create("blah.iac")
     gmgr.grant("blah.iac", "github", "orchard")
     tok = gmgr.token("blah.iac")
-    assert tok["token"] == "ghs_1_iac+orchard" and tok["repositories"] == ["spott/iac", "spott/orchard"]
+    assert tok["token"] == "ghs_2_iac+orchard" and tok["repositories"] == ["spott/iac", "spott/orchard"]
     mint = [r for r in gh.requests if r[1].startswith("/app/installations/77/access_tokens")]
-    assert mint[-1][3] == {"repositories": ["iac", "orchard"]}
+    assert mint[-1][3] == {
+        "repositories": ["iac", "orchard"],
+        "permissions": {"contents": "write", "pull_requests": "write", "workflows": "write", "metadata": "read"},
+    }
     assert mint[-1][2].startswith("Bearer ") and mint[-1][2].count(".") == 2
     # Second ask within the hour: the cache answers, nothing minted.
     assert gmgr.token("blah.iac")["token"] == tok["token"] and gh.minted == 1
     # A grant change revokes the cached token; the next mint is fresh and narrower.
     gmgr.revoke("blah.iac", "github", "orchard")
-    assert gh.revoked == ["token ghs_1_iac+orchard"]
+    assert gh.revoked == ["token ghs_2_iac+orchard"]
     assert gmgr.token("blah.iac")["token"] == "ghs_2_iac"
     # rm revokes what is live.
     gmgr.rm("blah.iac")
@@ -168,7 +172,7 @@ def test_token_is_narrowed_to_the_grants_cached_and_revoked(gmgr, gh, inc):
     assert not os.path.exists(gh._cache_path("blah.iac"))
 
 
-def test_token_refusals(gmgr, mgr, inc):
+def test_token_refusals(gmgr, mgr, inc, gh):
     gmgr.create("foo")
     with pytest.raises(OrchardError, match="no active github grants"):
         gmgr.token("foo")
@@ -178,6 +182,7 @@ def test_token_refusals(gmgr, mgr, inc):
     plain.create("bar")
     with pytest.raises(OrchardError, match="not configured"):
         plain.token("bar")
+    gh.repos.append("other/thing")
     gmgr.grant("foo", "github", "other/thing")
     with pytest.raises(GitHubError, match="only repositories under"):
         gmgr.token("foo")
@@ -189,10 +194,48 @@ def test_token_permissions_are_the_union_of_the_grants(gmgr, gh):
     gmgr.grant("foo", "github", "orchard", permissions={"contents": "write", "metadata": "read"})
     tok = gmgr.token("foo")
     assert tok["permissions"] == {"contents": "write", "metadata": "read"}
-    # One grant without permissions = the App's full set for the whole token.
+    # A grant without permissions brings in the default set.
+    gmgr.grant("foo", "github", "mcps")
+    tok = gmgr.token("foo")
+    assert tok["permissions"] == {"contents": "write", "pull_requests": "write", "workflows": "write", "metadata": "read"}
+    # An empty default set = the App's full set (no permissions in the request).
+    gmgr.cfg.github_default_permissions = {}
+    gmgr.revoke("foo", "github", "mcps")
     gmgr.grant("foo", "github", "mcps")
     gmgr.token("foo")
     assert [r for r in gh.requests if "access_tokens" in r[1]][-1][3] == {"repositories": ["iac", "mcps", "orchard"]}
+
+
+def test_create_time_grant_gets_the_default_permissions(gmgr, gh):
+    gmgr.create("blah.iac")
+    tok = gmgr.token("blah.iac")
+    body = [r for r in gh.requests if "access_tokens" in r[1]][-1][3]
+    assert body == {
+        "repositories": ["iac"],
+        "permissions": {"contents": "write", "pull_requests": "write", "workflows": "write", "metadata": "read"},
+    }
+    assert tok["permissions"]["contents"] == "write" and "administration" not in tok["permissions"]
+
+
+def test_create_and_grant_refuse_a_repository_the_app_cannot_reach(gmgr, gh, inc, logs):
+    with pytest.raises(OrchardError, match="no such repository spott/nosuch"):
+        gmgr.create("blah.nosuch")
+    assert inc.instance("blah--nosuch") is None
+    assert not any("creating volume" in m for m in logs)
+    gmgr.create("foo")
+    with pytest.raises(OrchardError, match="no such repository spott/nosuch"):
+        gmgr.grant("foo", "github", "nosuch")
+    assert gmgr.require("foo").grants == []
+    # Unknown owner, same answer; a reachable one is fine.
+    with pytest.raises(OrchardError, match="no such repository"):
+        gmgr.grant("foo", "github", "other/thing")
+    gmgr.grant("foo", "github", "orchard")
+    # GitHub unreachable with nothing cached: fail open, the mint will say.
+    gh.repos = None
+    gh.request = lambda *a, **k: (_ for _ in ()).throw(GitHubError("down"))
+    import shutil
+    shutil.rmtree(gmgr.cfg.state_dir, ignore_errors=True)
+    gmgr.grant("foo", "github", "whatever")
 
 
 def test_installation_and_repository_list_are_cached(gh):
@@ -253,7 +296,7 @@ def test_cli_grant_token_revoke(grun):
     g = json.loads(out)["grants"]
     assert g[1]["expires"] == "2026-11-01T14:00:00+00:00" and g[1]["permissions"] == {"contents": "read"}
     code, out, _ = grun("token", "github", "--git", self_name="blah.iac")
-    assert code == 0 and out == "username=x-access-token\npassword=ghs_1_iac+orchard\n"
+    assert code == 0 and out == "username=x-access-token\npassword=ghs_2_iac+orchard\n"
     code, out, _ = grun("token", "github", "blah.iac", "--json")
     assert code == 0 and json.loads(out)["workspace"] == "blah.iac"
     code, out, err = grun("grant", "blah.iac", "x", "--for", "soon")
@@ -429,7 +472,7 @@ def test_create_clones_the_repo_with_a_scoped_token_and_cleans_up(gmgr, gh, inc)
     assert "credential.helper=store --file=/run/user/1000/orchard/git-credentials" in clone
     push = [c for c in inc.calls if c[0] == "file_push" and c[2].endswith("git-credentials")][0]
     assert push[3:] == (1000, 100, "0600")
-    assert inc.files["blah--iac"]["/run/user/1000/orchard/git-credentials"] == "https://x-access-token:ghs_1_iac@github.com\n"
+    assert inc.files["blah--iac"]["/run/user/1000/orchard/git-credentials"] == "https://x-access-token:ghs_2_iac@github.com\n"
     assert ("rm", "-f", "/run/user/1000/orchard/git-credentials") in seen
     # Nothing is cloned for a plain name, and an existing checkout is left alone.
     assert gmgr.create("foo").clone is None

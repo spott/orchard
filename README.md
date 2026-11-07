@@ -90,8 +90,13 @@ dev ls                                          # GRANTS column
 
 With `services.orchard.github` the host holds a **GitHub App**'s private
 key and mints **installation tokens** per workspace, narrowed to the
-repositories in its active grants (and to the union of their permissions
-when every grant names some; otherwise the App's full set). Tokens live one
+repositories in its active grants and to the union of their permissions. A
+grant that names none means the host's default set (`github.defaultPermissions`:
+contents, pull requests and workflows read-write, metadata read), so a
+`name.repo` workspace never gets the App's administrative permissions unless
+an operator grants them. `create` and `grant` refuse a repository the App's
+installation does not reach (the wake resolver answers NXDOMAIN for the
+same). Tokens live one
 hour, are cached on the host until shortly before they expire, and are
 revoked whenever the grant list changes or the workspace is removed:
 
