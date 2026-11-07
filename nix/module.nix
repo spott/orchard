@@ -39,6 +39,7 @@ let
     github_key_file = if cfg.github.enable then cfg.github.privateKeyFile else "";
     github_owner = cfg.github.owner;
     github_api = cfg.github.apiUrl;
+    github_default_permissions = cfg.github.defaultPermissions;
     openssl = "${pkgs.openssl}/bin/openssl";
     secrets_env = cfg.secrets.env;
     secrets_token_file = if cfg.secrets.tokenFile == null then "" else cfg.secrets.tokenFile;
@@ -170,6 +171,15 @@ in
       apiUrl = lib.mkOption {
         type = lib.types.str;
         default = "https://api.github.com";
+      };
+      defaultPermissions = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { contents = "write"; pull_requests = "write"; workflows = "write"; metadata = "read"; };
+        description = ''
+          What a grant means when it names no permissions (`name.repo`
+          creates, `dev grant` without --permissions). A token carries the
+          union over the workspace's grants. `{ }` = the App's full set.
+        '';
       };
     };
 

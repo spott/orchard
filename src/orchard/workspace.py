@@ -856,6 +856,9 @@ class Manager:
         if grants is None:
             grants = []
             if clone_repo:
+                # A typo in the repo part must not leave a workspace behind.
+                if not self._repo_reachable(clone_repo):
+                    raise OrchardError(f"no such repository {clone_repo} (the GitHub App cannot reach it)")
                 grants.append(self._grant("github", clone_repo, by="create"))
         if address is None:
             address = self.allocate_address()
@@ -992,6 +995,8 @@ class Manager:
         with locks.held(self.cfg.lock_dir, name):
             ws = self.require(name)
             new = self._grant(kind, value, by=by, permissions=permissions, expires=expires)
+            if kind == "github" and not self._repo_reachable(new["value"]):
+                raise OrchardError(f"no such repository {new['value']} (the GitHub App cannot reach it)")
             kept = [g for g in ws.grants if (g.get("kind"), g.get("value")) != (new["kind"], new["value"])]
             self.log(f"granting {name} {kind} {new['value']}" + (f" until {expires}" if expires else ""))
             ws = self._set_grants(ws, kept + [new])
@@ -1025,15 +1030,17 @@ class Manager:
         if not grants:
             raise OrchardError(f"{name} has no active github grants")
         repos = sorted({g["value"] for g in grants})
-        # Per-grant permissions narrow the token; a token has one permission
-        # set for all its repositories, so grants that name any are unioned
-        # (write beats read) and a grant that names none means the App's full set.
-        permissions: dict[str, str] | None = None
-        if all(g.get("permissions") for g in grants):
-            permissions = {}
-            for g in grants:
-                for k, v in g["permissions"].items():
-                    permissions[k] = "write" if "write" in (v, permissions.get(k)) else v
+        # A token has one permission set for all its repositories: the union
+        # over the grants (write beats read). A grant that names none means
+        # the configured default set; an empty default means the App's full set.
+        permissions: dict[str, str] | None = {}
+        for g in grants:
+            perms = g.get("permissions") or self.cfg.github_default_permissions
+            if not perms:
+                permissions = None
+                break
+            for k, v in perms.items():
+                permissions[k] = "write" if "write" in (v, permissions.get(k)) else v
         tok = self.github.token(name, repos, permissions)
         return {**tok, "workspace": name}
 
@@ -1049,15 +1056,22 @@ class Manager:
 
     def repo_allowed(self, name: str) -> bool:
         """For a `name.repo` lookup: does the App reach that repository? True
-        when the name has no repo part, when GitHub is not configured, or
-        when GitHub cannot be asked and nothing is cached."""
+        when the name has no repo part or no owner is configured."""
         rep = names.repo(name)
-        if not rep or self.github is None or not self.cfg.github_owner:
+        if not rep or not self.cfg.github_owner:
+            return True
+        return self._repo_reachable(f"{self.cfg.github_owner}/{rep}")
+
+    def _repo_reachable(self, full_repo: str) -> bool:
+        """Is `owner/repo` in the App's installation? True when GitHub is not
+        configured, or cannot be asked and nothing is cached (fail open: the
+        mint then fails with GitHub's own answer)."""
+        if self.github is None:
             return True
         repos = self.github.installed_repos()
         if repos is None:
             return True
-        return f"{self.cfg.github_owner}/{rep}".lower() in {r.lower() for r in repos}
+        return full_repo.lower() in {r.lower() for r in repos}
 
     # -- secrets, shared volume, clone ---------------------------------------
 
