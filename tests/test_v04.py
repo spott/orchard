@@ -165,11 +165,12 @@ def test_token_is_narrowed_to_the_grants_cached_and_revoked(gmgr, gh, inc):
     assert gmgr.token("blah.iac")["token"] == tok["token"] and gh.minted == 2
     # A grant change revokes the cached token; the next mint is fresh and narrower.
     gmgr.revoke("blah.iac", "github", "orchard")
-    assert gh.revoked == ["token ghs_2_iac+orchard"]
-    assert gmgr.token("blah.iac")["token"] == "ghs_2_iac"
+    # (the metadata-only token used for the repository list was revoked first)
+    assert gh.revoked == ["token ghs_1_iac+orchard+mcps", "token ghs_2_iac+orchard"]
+    assert gmgr.token("blah.iac")["token"] == "ghs_3_iac"
     # rm revokes what is live.
     gmgr.rm("blah.iac")
-    assert gh.revoked[-1] == "token ghs_2_iac"
+    assert gh.revoked[-1] == "token ghs_3_iac"
     assert not os.path.exists(gh._cache_path("blah.iac"))
 
 
