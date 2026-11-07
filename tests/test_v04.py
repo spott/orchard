@@ -161,7 +161,8 @@ def test_token_is_narrowed_to_the_grants_cached_and_revoked(gmgr, gh, inc):
     }
     assert mint[-1][2].startswith("Bearer ") and mint[-1][2].count(".") == 2
     # Second ask within the hour: the cache answers, nothing minted.
-    assert gmgr.token("blah.iac")["token"] == tok["token"] and gh.minted == 1
+    # (two mints so far: the metadata-only one for the repository list, then this one)
+    assert gmgr.token("blah.iac")["token"] == tok["token"] and gh.minted == 2
     # A grant change revokes the cached token; the next mint is fresh and narrower.
     gmgr.revoke("blah.iac", "github", "orchard")
     assert gh.revoked == ["token ghs_2_iac+orchard"]
