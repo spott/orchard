@@ -3,6 +3,7 @@
 import pytest
 
 from orchard import OrchardError, cli
+from orchard.incus import IncusError
 from orchard.workspace import KEY, Manager, NoPrevious
 
 NEW = "aaaa1111bbbb2222cccc"
@@ -162,6 +163,35 @@ def test_rebase_failure_restores_the_old_instance(mgr, inc):
     assert ws.fingerprint == inc.images["workspace"] and ws.volume == "ws-foo"
     assert inc.inst["foo"]["config"].get(KEY + "managed") == "true" and KEY + "old-of" not in inc.inst["foo"]["config"]
     assert mgr.old_instances("foo") == []
+    # The volume is attached to the restored instance (it was detached after the rename).
+    assert inc.inst["foo"]["devices"]["work"]["source"] == "ws-foo"
+
+
+def test_rebase_pulls_identity_while_running_and_waits_out_a_busy_rename(mgr, inc):
+    mgr.create("foo")
+    _seed_identity(inc, "foo")
+    inc.images["next"] = NEW
+    inc.busy_renames = 2
+    inc.calls.clear()
+    new, old = mgr.rebase("foo", "next")
+    ops = [c[0] for c in inc.calls]
+    # Pull from the running instance (no host mount), then stop, then rename.
+    assert ops.index("file_pull") < ops.index("stop") < ops.index("rename")
+    assert [c for c in inc.calls if c[0] == "rename"] == [("rename", "foo", old)] * 3
+    assert new.running and new.fingerprint == NEW and inc.files["foo"]["/etc/machine-id"] == "0123456789abcdef\n"
+
+
+def test_rebase_gives_up_on_a_rename_that_stays_busy(mgr, inc):
+    from orchard import workspace
+
+    mgr.create("foo")
+    inc.images["next"] = NEW
+    inc.busy_renames = 10**6
+    with pytest.raises(IncusError, match="resource busy"):
+        mgr.rebase("foo", "next")
+    assert len(_calls(inc, "rename")) == workspace.RENAME_TRIES
+    # Nothing changed: still the same instance with its volume attached.
+    assert inc.inst["foo"]["devices"]["work"]["source"] == "ws-foo" and mgr.old_instances("foo") == []
 
 
 def test_rebase_rollback_and_prune(mgr, inc):

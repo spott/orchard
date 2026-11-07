@@ -26,6 +26,9 @@ WORK_DEVICE = "work"
 NIC_DEVICE = "eth0"
 STAMP = "%Y%m%dT%H%M%SZ"
 SNAPSHOT_PREFIX = "pre-rebase-"
+# A rename may hit EBUSY while Incus still has the instance mounted: retry.
+RENAME_TRIES = 60
+RENAME_WAIT = 1.0
 
 # What `rebase` carries from the old instance to its replacement so the
 # workspace keeps its ssh identity (host keys, machine-id) and its
@@ -527,25 +530,32 @@ class Manager:
                 return ws, None
             stamp = self.now().strftime(STAMP)
             vol = ws.volume or names.volume(name)
-            if ws.running:
-                self.reserve_address(ws)
-                self.log(f"stopping {name}")
-                self.inc.stop(name)
-            snap = SNAPSHOT_PREFIX + stamp.lower()
-            self.log(f"snapshotting {vol} as {snap}")
-            self.inc.volume_snapshot(cfg.pool, vol, snap)
-            inst = self.inc.instance(name) or {}
-            meta = {k: v for k, v in (inst.get("config") or {}).items() if k.startswith(KEY)}
-            meta[KEY + "rebased"] = self.now().isoformat(timespec="seconds")
-            old = self._free_old_name(name, stamp)
             tmp = tempfile.mkdtemp(prefix="orchard-rebase-")
             try:
+                # Pull the identity BEFORE stopping: a file pull from a stopped
+                # instance mounts its rootfs on the host and Incus leaves that
+                # mount behind for a while (~15 s on zfs), which makes the
+                # rename below fail with EBUSY. From a running instance the
+                # pull goes through the container and leaves nothing mounted.
                 identity = self._pull_identity(name, tmp)
-                self.inc.device_remove(name, WORK_DEVICE)
+                if ws.running:
+                    self.reserve_address(ws)
+                    self.log(f"stopping {name}")
+                    self.inc.stop(name)
+                snap = SNAPSHOT_PREFIX + stamp.lower()
+                self.log(f"snapshotting {vol} as {snap}")
+                self.inc.volume_snapshot(cfg.pool, vol, snap)
+                inst = self.inc.instance(name) or {}
+                meta = {k: v for k, v in (inst.get("config") or {}).items() if k.startswith(KEY)}
+                meta[KEY + "rebased"] = self.now().isoformat(timespec="seconds")
+                old = self._free_old_name(name, stamp)
                 self.log(f"keeping the old instance as {old}")
-                self.inc.rename(name, old)
-                self.inc.config_set(old, {KEY + "managed": "false", KEY + "old-of": name})
+                # Rename first, with the volume still attached: until this
+                # succeeds nothing about the workspace has changed.
+                self._rename_settled(name, old)
                 try:
+                    self.inc.config_set(old, {KEY + "managed": "false", KEY + "old-of": name})
+                    self.inc.device_remove(old, WORK_DEVICE)
                     self.log(f"creating {name} from image {target[:12]}")
                     self.inc.init(target, name, cfg.profiles, meta)
                     self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
@@ -558,10 +568,11 @@ class Manager:
                         self.inc.delete(name, force=True)
                     except IncusError:
                         pass
-                    self.inc.rename(old, name)
+                    self._rename_settled(old, name)
                     self.inc.config_set(name, {KEY + "managed": "true"})
                     self.inc.config_unset(name, KEY + "old-of")
-                    self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
+                    if WORK_DEVICE not in ((self.inc.instance(name) or {}).get("devices") or {}):
+                        self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
                     raise
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
@@ -588,10 +599,10 @@ class Manager:
                 self.inc.stop(name, force=True)
             parked = self._free_old_name(name, stamp)
             self.inc.device_remove(name, WORK_DEVICE)
-            self.inc.rename(name, parked)
+            self._rename_settled(name, parked)
             self.inc.config_set(parked, {KEY + "managed": "false", KEY + "old-of": name})
             self.log(f"restoring {previous} as {name} (the rebased instance is kept as {parked})")
-            self.inc.rename(previous, name)
+            self._rename_settled(previous, name)
             self.inc.config_set(name, {KEY + "managed": "true"})
             self.inc.config_unset(name, KEY + "old-of")
             self.inc.device_add(name, WORK_DEVICE, "disk", pool=cfg.pool, source=vol, path=cfg.work_path())
@@ -620,6 +631,21 @@ class Manager:
                     self.inc.volume_snapshot_delete(cfg.pool, vol, snap)
                     removed.append(f"{vol}/{snap}")
             return removed
+
+    def _rename_settled(self, old: str, new: str) -> None:
+        """`incus rename` that waits out the host-side mount Incus leaves
+        behind after a file operation on a stopped instance (the rename
+        fails with "device or resource busy" until it clears, ~15 s on zfs)."""
+        for attempt in range(RENAME_TRIES):
+            try:
+                self.inc.rename(old, new)
+                return
+            except IncusError as e:
+                if "resource busy" not in str(e).lower() or attempt == RENAME_TRIES - 1:
+                    raise
+                if attempt == 0:
+                    self.log(f"{old} is still mounted on the host; waiting to rename it")
+                self.sleep(RENAME_WAIT)
 
     def _free_old_name(self, name: str, stamp: str) -> str:
         """`<name>-old-<stamp>`, with a counter if that already exists (a
