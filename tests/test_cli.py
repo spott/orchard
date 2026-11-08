@@ -3,7 +3,6 @@ import json
 import pytest
 
 from orchard import cli
-from orchard.config import Config
 from orchard.workspace import Manager
 
 
