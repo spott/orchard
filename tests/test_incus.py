@@ -17,7 +17,9 @@ def test_run_does_not_inherit_stdin(tmp_path):
         proc = Incus(str(fake)).run("list")
     finally:
         os.dup2(saved, 0)
-        os.close(saved); os.close(r); os.close(w)
+        os.close(saved)
+        os.close(r)
+        os.close(w)
     assert proc.stdout.strip() == "stdin-eof"
 
     try:
