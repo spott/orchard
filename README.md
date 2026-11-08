@@ -30,7 +30,11 @@ Orchard is a small Python package (standard library only) plus a NixOS module:
   database; `dev ls` is a filtered `incus list`.
 - A workspace name is **`name` or `name.repo`**. The repo part matters
   only at create: `blah.iac` clones `<owner>/iac` into `~/work/iac` and
-  seeds the workspace's grants with that repository (see below). From then
+  seeds the workspace's grants with that repository (see below). A bare
+  name that is one of the owner's repositories does the same: `iac` (or
+  `ssh iac.orchard`) clones `<owner>/iac`; a bare name the App's
+  installation does not list is a plain, empty workspace — so a scratch
+  workspace just needs a name that is not one of your repositories. From then
   on `blah.iac` is just its name: what it may reach is its grant list,
   which may drift from the name (a `blah.iac` can lose `iac` and gain
   `orchard`; renaming is optional). Incus instance names cannot contain
@@ -114,7 +118,11 @@ the key never enters a workspace.
 
 A lookup of `name.repo` for a repository the App does not reach answers
 NXDOMAIN and creates nothing (the installation's repository list is cached
-for an hour); a typo in the name part still creates, and `gc` reaps it.
+for an hour); a typo in the name part still creates, and `gc` reaps it. A
+bare name is never refused: it clones when the (cached) list has a
+repository of that name and is a plain workspace otherwise — including when
+the list cannot be fetched at all, so a GitHub outage degrades to "no clone",
+not "no workspace".
 
 ## Secrets at start
 

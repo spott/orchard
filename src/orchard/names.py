@@ -3,7 +3,8 @@ names that map onto them.
 
 A workspace name is `<name>` or `<name>.<repo>`. Each part is a lowercase DNS
 label. The repo part matters only at create (clone `<owner>/<repo>`, seed the
-grant list with that repository); afterwards the whole thing is just the
+grant list with that repository; a bare `<name>` that is itself one of the
+owner's repositories does the same); afterwards the whole thing is just the
 workspace's name and what it may reach is in its grants. Incus instance names
 cannot contain dots, so the dot is encoded as `--` (`blah.iac` is instance
 `blah--iac`, volume `ws-blah--iac`) and `--` is reserved inside a label."""
