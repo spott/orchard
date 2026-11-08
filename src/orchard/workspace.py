@@ -846,8 +846,9 @@ class Manager:
         inst = names.instance(name)
         vol = names.volume(name)
         made_volume = False
-        # `name.repo`, or `--repo owner/repo`: the repository to clone and
-        # the first grant. Anything else given as --repo is just recorded.
+        # `name.repo`, `--repo owner/repo`, or a bare name that is one of the
+        # owner's repositories: the repository to clone and the first grant.
+        # Anything else given as --repo is just recorded.
         clone_repo = self._repo_for(name, repo)
         if clone_repo and not repo:
             repo = f"https://github.com/{clone_repo}"
@@ -966,8 +967,11 @@ class Manager:
 
     def _repo_for(self, name: str, repo: str | None) -> str | None:
         """The repository a new workspace is about: `--repo owner/repo` (or a
-        bare repo name), else the repo part of `name.repo`. URLs recorded
-        with --repo are left alone (None)."""
+        bare repo name), else the repo part of `name.repo`, else — for a bare
+        `name` — `<owner>/name` when the App's installation is known to list
+        it (so `iac` and `iac.orchard` at the front door clone iac; `foo` is a
+        plain workspace unless the owner has a repository called foo). URLs
+        recorded with --repo are left alone (None)."""
         if repo:
             if "://" in repo or repo.startswith("github:") or repo.count("/") > 1:
                 return None
@@ -975,10 +979,15 @@ class Manager:
                 return self._full_repo(repo)
             except OrchardError:
                 return None
+        if not self.cfg.github_owner:
+            return None
         rep = names.repo(name)
-        if rep and self.cfg.github_owner:
+        if rep:
             return f"{self.cfg.github_owner}/{rep}"
-        return None
+        # Fail closed, unlike `name.repo`: a bare name only becomes a clone
+        # when the repository list is in hand and has it.
+        full = f"{self.cfg.github_owner}/{name}"
+        return full if self._repo_listed(full) is True else None
 
     def _set_grants(self, ws: Workspace, grants: list[dict[str, Any]]) -> Workspace:
         if grants:
@@ -1066,11 +1075,16 @@ class Manager:
         """Is `owner/repo` in the App's installation? True when GitHub is not
         configured, or cannot be asked and nothing is cached (fail open: the
         mint then fails with GitHub's own answer)."""
+        return self._repo_listed(full_repo) is not False
+
+    def _repo_listed(self, full_repo: str) -> bool | None:
+        """Whether the App's installation lists `owner/repo`; None when there
+        is no App or its repository list cannot be had right now."""
         if self.github is None:
-            return True
+            return None
         repos = self.github.installed_repos()
         if repos is None:
-            return True
+            return None
         return full_repo.lower() in {r.lower() for r in repos}
 
     # -- secrets, shared volume, clone ---------------------------------------

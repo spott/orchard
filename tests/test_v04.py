@@ -117,6 +117,54 @@ def test_name_repo_seeds_a_grant_and_plain_names_get_none(gmgr):
     assert gmgr.create("foo").grants == []
 
 
+def test_bare_name_of_an_owner_repository_clones_and_grants_it(gmgr, gh, inc):
+    _clone_target_missing(inc)
+    # `iac` (what `ssh iac.orchard` creates) is spott/iac: same as `x.iac`.
+    ws = gmgr.create("iac")
+    assert ws.instance == "iac" and ws.repos() == ["spott/iac"] and ws.grants[0]["by"] == "create"
+    assert ws.repo == "https://github.com/spott/iac" and ws.clone == "ok"
+    assert any(c[:2] == ("git", "-c") and c[-1].endswith("/work/iac") for c in _exec_cmds(inc, "iac"))
+    # The front-door path (repo=None) does the same.
+    ws = gmgr.ensure_running("orchard")
+    assert ws.repos() == ["spott/orchard"] and ws.clone == "ok"
+    # Not one of the owner's repositories: a plain workspace, nothing cloned.
+    ws = gmgr.create("scratch")
+    assert ws.grants == [] and ws.repo is None and ws.clone is None
+    assert not any(c[0] == "git" for c in _exec_cmds(inc, "scratch"))
+
+
+def test_bare_name_clone_fails_closed_when_the_repo_list_is_unknown(gmgr, gh, inc):
+    def request(method, path, auth, body=None):
+        if path.startswith("/installation/repositories"):
+            return 503, {"message": "down"}
+        return FakeGitHub.request(gh, method, path, auth, body)
+
+    gh.request = request
+    ws = gmgr.create("iac")  # nothing cached yet: no list, so no clone
+    assert ws.grants == [] and ws.repo is None and ws.clone is None
+    assert gmgr.require("iac").instance == "iac"
+
+
+def _exec_cmds(inc, inst):
+    return [c[2] for c in inc.calls if c[0] == "exec" and c[1] == inst]
+
+
+def _clone_target_missing(inc):
+    """The fake answers every exec with rc 0, which `_clone` reads as "target
+    exists": make `test -e` say missing so the clone runs."""
+    import subprocess
+
+    orig = inc.exec
+
+    def exec_(name, *cmd, check=True, user=None, group=None, env=None):
+        if cmd[:2] == ("test", "-e"):
+            inc.calls.append(("exec", name, cmd))
+            return subprocess.CompletedProcess([], 1, "", "")
+        return orig(name, *cmd, check=check, user=user, group=group, env=env)
+
+    inc.exec = exec_
+
+
 def test_create_repo_flag_grants_and_urls_are_only_recorded(gmgr, gh):
     gh.repos.append("other/thing")  # before the repo list is fetched and cached
     assert gmgr.create("a", repo="orchard").repos() == ["spott/orchard"]
@@ -175,6 +223,7 @@ def test_token_is_narrowed_to_the_grants_cached_and_revoked(gmgr, gh, inc):
 
 
 def test_token_refusals(gmgr, mgr, inc, gh):
+    gh.repos.append("other/thing")  # before any create: a bare name now fetches and caches the list
     gmgr.create("foo")
     with pytest.raises(OrchardError, match="no active github grants"):
         gmgr.token("foo")
@@ -184,7 +233,6 @@ def test_token_refusals(gmgr, mgr, inc, gh):
     plain.create("bar")
     with pytest.raises(OrchardError, match="not configured"):
         plain.token("bar")
-    gh.repos.append("other/thing")
     gmgr.grant("foo", "github", "other/thing")
     with pytest.raises(GitHubError, match="only repositories under"):
         gmgr.token("foo")
