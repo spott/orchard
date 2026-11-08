@@ -132,6 +132,13 @@ def test_gc_remembers_a_login_across_rebase(amgr, inc):
     assert amgr.gc() == []
     assert "mine" in inc.inst
 
+    # A young workspace with a login is stamped right away, so a rebase in
+    # its first day cannot lose the evidence either.
+    amgr.create("young", origin="dns")
+    inc.journal["young"] = "Nov 04 sshd-session[9]: Accepted publickey for spott from 10.42.1.42"
+    assert amgr.gc() == []
+    assert inc.inst["young"]["config"][KEY + "used"] == FROZEN.isoformat(timespec="seconds")
+
     # A rebased workspace that was never used is still a typo.
     amgr.create("typo2", origin="dns")
     inc.inst["typo2"]["config"][KEY + "created"] = old
