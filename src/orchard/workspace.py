@@ -432,12 +432,16 @@ class Manager:
             created = datetime.fromisoformat(ws.created)
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
-            if created > stale or ws.used:
+            if ws.used:
                 continue
             if self.logged_in(ws):
-                # Remember it in metadata: the journal that proved it is on
-                # the instance's rootfs and does not survive a rebase.
+                # Remember it in metadata the moment it is seen, however
+                # young the workspace: the journal that proved it is on the
+                # instance's rootfs and does not survive a rebase, which can
+                # happen before the workspace is old enough to judge.
                 self.inc.config_set(ws.instance, {KEY + "used": self.now().isoformat(timespec="seconds")})
+                continue
+            if created > stale:
                 continue
             self.log(f"{ws.name}: created by a lookup {ws.created}, never logged into")
             if not dry_run:
