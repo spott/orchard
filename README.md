@@ -184,7 +184,9 @@ NOERROR, never NXDOMAIN, so a caching resolver cannot poison the A record.
 
 The price of creating on lookup is that a typo creates a workspace. `dev gc`
 (daily) removes a lookup-created workspace that nobody has ever logged into
-after `untouchedHours` (24), volume to trash as usual. Set
+after `untouchedHours` (24), volume to trash as usual. The first login `gc`
+sees is recorded as `user.orchard.used`, so a later `rebase` (fresh instance,
+empty journal) cannot make a workspace in use look like a typo. Set
 `wake.createOnLookup = false` to answer NXDOMAIN for unknown names instead;
 then `dev create` (from anywhere: `ssh dev@orchard.example.com dev create
 foo`) stays the one explicit step.

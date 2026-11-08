@@ -112,6 +112,33 @@ def test_gc_removes_lookup_created_workspaces_nobody_logged_into(amgr, inc):
     assert amgr.gc() == []
 
 
+def test_gc_remembers_a_login_across_rebase(amgr, inc):
+    """A rebase gives the workspace a fresh instance and so an empty journal;
+    the login gc saw before must still protect it (review 2026-11-08, #1)."""
+    amgr.create("mine", origin="dns")
+    amgr.create("typo", origin="dns")
+    old = "2026-10-01T00:00:00+00:00"
+    for n in ("mine", "typo"):
+        inc.inst[n]["config"][KEY + "created"] = old
+    inc.journal["mine"] = "Nov 04 sshd-session[9]: Accepted publickey for spott from 10.42.1.42"
+    assert amgr.gc() == ["typo"]
+    assert inc.inst["mine"]["config"][KEY + "used"] == FROZEN.isoformat(timespec="seconds")
+    assert next(w for w in amgr.list() if w.name == "mine").used is not None
+
+    inc.images["workspace-next"] = "aaaa1111bbbb2222cccc"
+    new, parked = amgr.rebase("mine", "workspace-next")
+    assert parked and new.used is not None
+    inc.journal.pop("mine", None)  # the new instance has never seen a login
+    assert amgr.gc() == []
+    assert "mine" in inc.inst
+
+    # A rebased workspace that was never used is still a typo.
+    amgr.create("typo2", origin="dns")
+    inc.inst["typo2"]["config"][KEY + "created"] = old
+    amgr.rebase("typo2", "workspace-next")
+    assert amgr.gc() == ["typo2"]
+
+
 def test_self_service_install(acfg, inc, logs, tmp_path, monkeypatch):
     import subprocess
 
