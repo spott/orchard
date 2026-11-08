@@ -151,6 +151,10 @@ class Workspace:
     fingerprint: str | None = None
     # When `rebase` last replaced the instance, if ever.
     rebased: str | None = None
+    # When `gc` first saw someone logged into this lookup-created workspace.
+    # Login evidence lives in the instance's journal, which a rebase does not
+    # carry over; this stamp is metadata, so it does.
+    used: str | None = None
     # The Incus instance name (`blah--iac` for workspace `blah.iac`).
     instance: str = ""
     # What the workspace may reach, as `dev grant` recorded it: one dict per
@@ -237,6 +241,7 @@ def from_instance(inst: dict[str, Any]) -> Workspace:
         selfkey=cfg.get(KEY + "selfkey"),
         fingerprint=image or None,
         rebased=cfg.get(KEY + "rebased"),
+        used=cfg.get(KEY + "used"),
         instance=inst["name"],
         grants=parse_grants(cfg.get(KEY + "grants")),
         clone=cfg.get(KEY + "clone"),
@@ -427,7 +432,12 @@ class Manager:
             created = datetime.fromisoformat(ws.created)
             if created.tzinfo is None:
                 created = created.replace(tzinfo=timezone.utc)
-            if created > stale or self.logged_in(ws):
+            if created > stale or ws.used:
+                continue
+            if self.logged_in(ws):
+                # Remember it in metadata: the journal that proved it is on
+                # the instance's rootfs and does not survive a rebase.
+                self.inc.config_set(ws.instance, {KEY + "used": self.now().isoformat(timespec="seconds")})
                 continue
             self.log(f"{ws.name}: created by a lookup {ws.created}, never logged into")
             if not dry_run:
@@ -452,7 +462,8 @@ class Manager:
     def logged_in(self, ws: Workspace) -> bool:
         """Has anyone ever authenticated to this (running) workspace's sshd?
         Both the front door and direct ssh/mosh end up as an `Accepted`
-        line in the container's journal."""
+        line in the container's journal. Only this instance's journal: see
+        `Workspace.used` for what carries across a rebase."""
         if not ws.running:
             return True
         proc = self.inc.exec(ws.instance, "journalctl", "-q", "-g", "Accepted publickey", check=False)
