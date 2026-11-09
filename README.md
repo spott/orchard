@@ -135,10 +135,10 @@ printer hosts, `deploy` → `ops` on every host. Which principal reaches what
 is the fleet's business; orchard only signs what was granted.
 
 ```
-dev grant blah.iac --kind ssh ro                 # diagnose anywhere
-dev grant blah.iac --kind ssh printers --for 4h  # operate one host group, for a while
-dev grant iac --kind ssh deploy --for 2h         # the time-boxed deploy window
-dev revoke blah.iac --kind ssh printers          # certificate dropped at once
+dev grant blah.iac ssh:ro                 # diagnose anywhere (`--kind ssh ro` is the long form)
+dev grant blah.iac ssh:printers --for 4h  # operate one host group, for a while
+dev grant iac ssh:deploy --for 2h         # the time-boxed deploy window
+dev revoke blah.iac ssh:printers          # certificate dropped at once
 dev token ssh blah.iac                           # operator; `dev token ssh` from inside
 ```
 

@@ -1034,8 +1034,9 @@ class Manager:
             kept = [g for g in ws.grants if (g.get("kind"), g.get("value")) != (new["kind"], new["value"])]
             self.log(f"granting {name} {kind} {new['value']}" + (f" until {expires}" if expires else ""))
             ws = self._set_grants(ws, kept + [new])
-            # A cached token may be wider or narrower than the new list.
-            self._revoke_tokens(name)
+            if kind == "github":
+                # A cached token may be wider or narrower than the new list.
+                self._revoke_tokens(name)
             if kind == "ssh":
                 # Takes effect now, not at the next connection's re-mint.
                 self._push_ssh_cert(ws)
@@ -1052,7 +1053,8 @@ class Manager:
                 raise OrchardError(f"{name} has no {kind} grant for {value!r}")
             self.log(f"revoking {kind} {value} from {name}")
             ws = self._set_grants(ws, kept)
-            self._revoke_tokens(name)
+            if kind == "github":
+                self._revoke_tokens(name)
             if kind == "ssh":
                 # Drop the live certificate; a narrower one follows if grants remain.
                 self._drop_ssh_cert(ws)
