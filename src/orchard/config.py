@@ -61,6 +61,18 @@ class Config:
     # grants and pushes key + certificate into its tmpfs. Empty = off.
     ssh_ca_key_file: str = ""
     ssh_cert_minutes: int = 60
+    # Deploy window. While a workspace holds an active `ssh` grant for
+    # deploy_principal (which must carry an expiry of at most
+    # deploy_max_hours), the host reads deploy_env (env var -> op://
+    # reference) with the service account token in deploy_token_file — a
+    # second, wider account than the one behind secrets_env — and pushes
+    # them, plus that token as OP_SERVICE_ACCOUNT_TOKEN, into
+    # <secrets_path>/deploy.env. The file is removed when the grant goes
+    # (`dev sweep`, a timer). Empty token file = off.
+    deploy_token_file: str = ""
+    deploy_env: dict[str, str] = field(default_factory=dict)
+    deploy_principal: str = "deploy"
+    deploy_max_hours: int = 4
     # The wake resolver (`orchard-dns`): a lookup of `<name>.<zone>` starts
     # a stopped workspace, or creates a missing one when dns_create is set.
     dns_listen: str = ""
@@ -129,6 +141,9 @@ class Config:
 
     def ssh_ca_enabled(self) -> bool:
         return bool(self.ssh_ca_key_file)
+
+    def deploy_enabled(self) -> bool:
+        return bool(self.ssh_ca_key_file and self.deploy_token_file)
 
     def ssh_cert_dir(self) -> str:
         """Where a workspace's ssh certificate lands: next to the secrets env."""

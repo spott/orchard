@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import copy
+import subprocess
 from datetime import datetime, timezone
 from typing import Any
 
 import pytest
 
+from orchard import workspace
 from orchard.config import Config
 from orchard.incus import Incus, IncusError
 from orchard.workspace import Manager
@@ -233,3 +235,38 @@ def logs() -> list[str]:
 @pytest.fixture
 def mgr(cfg, inc, logs) -> Manager:
     return Manager(cfg, inc, log=logs.append, probe=lambda ip, port: True, sleep=lambda s: None, now=lambda: FROZEN)
+
+
+@pytest.fixture
+def ca_cfg(cfg, tmp_path):
+    """A host with the ssh CA configured (0.5)."""
+    ca = tmp_path / "ca"
+    ca.write_text("FAKE CA PRIVATE KEY\n")
+    cfg.ssh_ca_key_file = str(ca)
+    cfg.ssh_keygen = "ssh-keygen"
+    return cfg
+
+
+@pytest.fixture
+def keygen(monkeypatch):
+    """A fake ssh-keygen: writes a key pair for `-t`, a certificate for `-s`;
+    records every argv. Anything else (op, …) runs for real."""
+    calls: list[list[str]] = []
+    real_run = subprocess.run
+
+    def fake(argv, **kw):
+        if not str(argv[0]).endswith("ssh-keygen"):
+            return real_run(argv, **kw)
+        calls.append(argv)
+        if "-t" in argv:
+            key = argv[argv.index("-f") + 1]
+            open(key, "w").write("PRIVATE\n")
+            open(key + ".pub", "w").write(f"ssh-ed25519 AAAAWS {argv[argv.index('-C') + 1]}\n")
+        elif "-s" in argv:
+            pub = argv[-1]
+            principals = argv[argv.index("-n") + 1]
+            open(pub[: -len(".pub")] + "-cert.pub", "w").write(f"ssh-ed25519-cert-v01@openssh.com AAAACERT {principals}\n")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(workspace.subprocess, "run", fake)
+    return calls

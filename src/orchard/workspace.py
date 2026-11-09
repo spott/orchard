@@ -13,6 +13,7 @@ import ipaddress
 import json
 import re
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -37,6 +38,7 @@ GRANT_KINDS = {"github", "ssh"}
 # An ssh certificate principal (the role a grant conveys: ro, printers, deploy).
 PRINCIPAL_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 SSH_KEY_NAME = "id_ed25519"
+DEPLOY_ENV_FILE = "deploy.env"
 # How long `dev` waits for the workspace user's runtime tmpfs (/run/user/<uid>,
 # made by logind for the lingering user) before pushing secrets into it.
 RUNTIME_DIR_TRIES = 40
@@ -155,6 +157,10 @@ class Workspace:
     fingerprint: str | None = None
     # When `rebase` last replaced the instance, if ever.
     rebased: str | None = None
+    # Principals of the certificate last minted (`sweep` re-mints on change),
+    # and the expiry of the deploy window whose env file is in place.
+    ssh_principals: str | None = None
+    deploy: str | None = None
     # When `gc` first saw someone logged into this lookup-created workspace.
     # Login evidence lives in the instance's journal, which a rebase does not
     # carry over; this stamp is metadata, so it does.
@@ -246,6 +252,8 @@ def from_instance(inst: dict[str, Any]) -> Workspace:
         fingerprint=image or None,
         rebased=cfg.get(KEY + "rebased"),
         used=cfg.get(KEY + "used"),
+        ssh_principals=cfg.get(KEY + "ssh-principals"),
+        deploy=cfg.get(KEY + "deploy"),
         instance=inst["name"],
         grants=parse_grants(cfg.get(KEY + "grants")),
         clone=cfg.get(KEY + "clone"),
@@ -938,6 +946,7 @@ class Manager:
         self._install_self(ws)
         self._push_secrets(ws)
         self._push_ssh_cert(ws)
+        self._push_deploy(ws, fresh=True)
         if clone_repo:
             self._clone(ws, clone_repo)
         self._hook("on_create", ws)
@@ -959,6 +968,7 @@ class Manager:
         self._attach_logins(ws.instance)
         self._push_secrets(ws)
         self._push_ssh_cert(ws)
+        self._push_deploy(ws, fresh=True)
         return ws
 
     # -- grants and tokens ----------------------------------------------------
@@ -974,6 +984,17 @@ class Manager:
             value = value.strip()
             if not PRINCIPAL_RE.fullmatch(value):
                 raise OrchardError(f"{value!r}: an ssh principal is lowercase letters, digits and dashes (ro, printers, deploy)")
+            if value == self.cfg.deploy_principal:
+                # The deploy window is always time-boxed: it is lab-admin
+                # while it lasts.
+                limit = timedelta(hours=self.cfg.deploy_max_hours)
+                if not expires:
+                    raise OrchardError(f"ssh:{value} needs --for (at most {self.cfg.deploy_max_hours}h): it is the deploy window")
+                until = datetime.fromisoformat(expires)
+                if until.tzinfo is None:
+                    until = until.replace(tzinfo=timezone.utc)
+                if until - self.now() > limit:
+                    raise OrchardError(f"ssh:{value}: the deploy window is at most {self.cfg.deploy_max_hours}h")
         return {
             "kind": kind, "value": value, "permissions": permissions or None, "expires": expires,
             "by": by, "at": self.now().isoformat(timespec="seconds"),
@@ -1040,6 +1061,8 @@ class Manager:
             if kind == "ssh":
                 # Takes effect now, not at the next connection's re-mint.
                 self._push_ssh_cert(ws)
+                self._push_deploy(ws)
+                ws = self.require(name)  # the pushes recorded more metadata
             return ws
 
     def revoke(self, name: str, kind: str, value: str) -> Workspace:
@@ -1059,6 +1082,8 @@ class Manager:
                 # Drop the live certificate; a narrower one follows if grants remain.
                 self._drop_ssh_cert(ws)
                 self._push_ssh_cert(ws)
+                self._push_deploy(ws)
+                ws = self.require(name)
             return ws
 
     def token(self, name: str, kind: str = "github") -> dict[str, Any]:
@@ -1128,6 +1153,7 @@ class Manager:
             self.inc.exec(ws.instance, "chmod", "0700", cfg.secrets_path(), dst_dir, check=False)
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
+        self.inc.config_set(ws.instance, {KEY + "ssh-principals": ",".join(principals)})
         self.log(f"{ws.name}: ssh certificate for {', '.join(principals)} until {expires.isoformat(timespec='minutes')}")
         return {
             "workspace": ws.name, "principals": principals, "identity": identity,
@@ -1157,6 +1183,79 @@ class Manager:
             return
         d = self.cfg.ssh_cert_dir()
         self.inc.exec(ws.instance, "rm", "-f", f"{d}/{SSH_KEY_NAME}", f"{d}/{SSH_KEY_NAME}-cert.pub", check=False)
+        self.inc.config_unset(ws.instance, KEY + "ssh-principals")
+
+    # -- deploy window --------------------------------------------------------
+
+    def _deploy_active(self, ws: Workspace) -> dict[str, Any] | None:
+        for g in active_grants(ws.grants, self.now()):
+            if g.get("kind") == "ssh" and g.get("value") == self.cfg.deploy_principal:
+                return g
+        return None
+
+    def _push_deploy(self, ws: Workspace, *, fresh: bool = False) -> None:
+        """Open or close the deploy window's env file to match the grants.
+        `fresh`: the runtime tmpfs is new (a start), so push even if the
+        record says the window is already open. Never fails a start: a
+        problem is logged and the file is left absent."""
+        cfg = self.cfg
+        if not cfg.deploy_enabled() or not ws.running:
+            return
+        grant = self._deploy_active(ws)
+        path = f"{cfg.secrets_path()}/{DEPLOY_ENV_FILE}"
+        if grant is None:
+            if ws.deploy is not None:
+                self.inc.exec(ws.instance, "rm", "-f", path, check=False)
+                self.inc.config_unset(ws.instance, KEY + "deploy")
+                self.log(f"{ws.name}: deploy window closed")
+            return
+        if ws.deploy == grant.get("expires") and not fresh:
+            return
+        try:
+            token = open(cfg.deploy_token_file).read().strip()
+            values = {k: self.secrets.read(ref, token_file=cfg.deploy_token_file) for k, ref in sorted(cfg.deploy_env.items())}
+        except (OSError, OrchardError) as e:
+            self.log(f"warning: deploy window for {ws.name} not opened: {e}")
+            return
+        if not self._runtime_dir_ready(ws.instance):
+            self.log(f"warning: /run/user/{cfg.uid} never appeared in {ws.name}; deploy window not opened")
+            return
+        fd, tmp = tempfile.mkstemp(prefix="orchard-deploy-")
+        try:
+            with os.fdopen(fd, "w") as f:
+                f.write(f"# orchard: deploy window until {grant.get('expires')}; `dev sweep` removes this when it lapses\n")
+                f.write(f"OP_SERVICE_ACCOUNT_TOKEN={shlex.quote(token)}\n")
+                for k, v in values.items():
+                    f.write(f"{k}={shlex.quote(v)}\n")
+            self.inc.file_push(tmp, ws.instance, path, uid=cfg.uid, gid=cfg.gid, mode="0600")
+        except IncusError as e:
+            self.log(f"warning: could not push the deploy env into {ws.name}: {e}")
+            return
+        finally:
+            os.unlink(tmp)
+        self.inc.config_set(ws.instance, {KEY + "deploy": grant.get("expires") or ""})
+        self.log(f"{ws.name}: deploy window open until {grant.get('expires')} ({', '.join(values) or 'token only'})")
+
+    def sweep(self) -> list[str]:
+        """Make every running workspace's certificate and deploy window match
+        its grants as they are now: expired grants lose their principals (a
+        narrower certificate, or none) and a lapsed deploy window loses its
+        env file. A timer runs this every few minutes."""
+        touched: list[str] = []
+        for ws in self.list():
+            if not ws.running:
+                continue
+            want = self._ssh_principals(ws)
+            have = [p for p in (ws.ssh_principals or "").split(",") if p]
+            if self.cfg.ssh_ca_enabled() and have != want:
+                self._drop_ssh_cert(ws)
+                self._push_ssh_cert(ws)
+                touched.append(ws.name)
+            before = ws.deploy
+            self._push_deploy(ws)
+            if self.require(ws.name).deploy != before and ws.name not in touched:
+                touched.append(ws.name)
+        return touched
 
     def _revoke_tokens(self, name: str) -> None:
         if self.github is None:

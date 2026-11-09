@@ -50,12 +50,14 @@ class Secrets:
         except OSError:
             return [], None
 
-    def read(self, ref: str) -> str:
-        """`op read` one reference with the service account token."""
-        if not self.cfg.secrets_token_file:
+    def read(self, ref: str, *, token_file: str | None = None) -> str:
+        """`op read` one reference with the service account token (the
+        workspace-wide one by default; the deploy window passes its own)."""
+        token_file = token_file or self.cfg.secrets_token_file
+        if not token_file:
             raise SecretsError("secrets_token_file is not configured")
         try:
-            token = open(self.cfg.secrets_token_file).read().strip()
+            token = open(token_file).read().strip()
         except OSError as e:
             raise SecretsError(f"cannot read the 1Password service account token: {e}") from e
         proc = subprocess.run(
