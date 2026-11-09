@@ -97,7 +97,10 @@ class FakeIncus(Incus):
     def config_unset(self, name, *keys):
         self.calls.append(("config_unset", name, keys))
         for k in keys:
-            self.inst[name]["config"].pop(k, None)
+            # Like Incus: unsetting a key that is not set is an error.
+            if k not in self.inst[name]["config"]:
+                raise IncusError([self.binary, "config", "unset", name, k], 1, f"Error: Can't unset key '{k}', it's not currently set")
+            del self.inst[name]["config"][k]
 
     def image_fingerprint(self, ref):
         if ref in self.images:

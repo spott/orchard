@@ -117,3 +117,14 @@ def test_deploy_disabled_changes_nothing(mgr, ca_cfg, inc, keygen):
     mgr.grant("iac", "ssh", "deploy", expires=(FROZEN + timedelta(hours=2)).isoformat())
     assert "/run/user/1000/orchard/deploy.env" not in inc.files.get("iac", {})
     assert mgr.require("iac").deploy is None
+
+
+def test_sweep_copes_with_a_certificate_minted_before_principals_were_recorded(dmgr, inc, keygen):
+    dmgr.create("old")
+    dmgr.grant("old", "ssh", "printers")
+    # Pretend 0.5 minted it: a certificate exists but no record of its principals.
+    inc.inst["old"]["config"].pop(KEY + "ssh-principals")
+    assert dmgr.sweep() == ["old"]
+    assert dmgr.require("old").ssh_principals == "printers"
+    # And a second sweep is a no-op.
+    assert dmgr.sweep() == []
