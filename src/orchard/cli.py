@@ -196,6 +196,12 @@ def cmd_token(mgr: Manager, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sweep(mgr: Manager, args: argparse.Namespace) -> int:
+    touched = mgr.sweep()
+    _emit(args, {"touched": touched}, f"swept: {', '.join(touched) or 'nothing to change'}")
+    return 0
+
+
 def cmd_secrets(mgr: Manager, args: argparse.Namespace) -> int:
     sec = mgr.secrets
     if not sec.configured:
@@ -216,6 +222,7 @@ def cmd_secrets(mgr: Manager, args: argparse.Namespace) -> int:
             mgr.log(f"{ws.name}: not running, nothing pushed")
             continue
         mgr._push_secrets(ws)
+        mgr._push_deploy(ws)
         pushed.append(ws.name)
     _emit(args, {"refreshed": refreshed, "pushed": pushed}, f"pushed into {', '.join(pushed) or 'no workspace'}")
     return 0
@@ -283,6 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
     t.add_argument("kind", choices=["github", "ssh"])
     t.add_argument("name")
     t.add_argument("--git", action="store_true", help="print it in git credential-helper form")
+    add("sweep", cmd_sweep, "re-mint narrower certificates and close lapsed deploy windows as grants expire (a timer)")
     sc = add("secrets", cmd_secrets, "the secrets every workspace gets at start: refresh the cache, push, list")
     sc.add_argument("action", choices=["refresh", "push", "ls"])
     sc.add_argument("names", nargs="*", help="workspaces to push into (default: every running one)")

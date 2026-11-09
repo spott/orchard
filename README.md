@@ -153,6 +153,29 @@ the volume: a stopped or rebased workspace holds no certificate, and a fork
 inherits grants but is minted afresh. Revoking a grant drops the live
 certificate; sessions already open stay open until they end.
 
+## The deploy window
+
+Changing the lab (a Colmena switch, a Proxmox snapshot) needs more than a
+certificate: the Proxmox password and the 1Password reads behind Colmena's
+keys. With `services.orchard.deploy` those exist in a workspace only while it
+holds an `ssh:deploy` grant, which must carry an expiry (`--for`, at most
+`deploy.maxHours`):
+
+```
+dev grant iac ssh:deploy --for 2h    # open the window: certificate gains `deploy`,
+                                     # /run/user/<uid>/orchard/deploy.env appears
+dev revoke iac ssh:deploy            # close it now; `dev sweep` (timer) closes it on expiry
+```
+
+`deploy.env` holds `OP_SERVICE_ACCOUNT_TOKEN` (the deploy account, read-only
+on the vault deploys need) and the configured `env` values, so an unchanged
+`nix run .#switchOne.<node>` works from inside; the image's shell sources it
+like the secrets env. While the window is open the workspace is as powerful
+as the operator — that is the point of the time box. `dev sweep` also
+re-mints a narrower certificate whenever a workspace's active principals
+change, so an expired `printers` grant stops working within minutes, not at
+the certificate's next re-mint.
+
 ## Secrets at start
 
 `services.orchard.secrets.env` maps environment variables to `op://`

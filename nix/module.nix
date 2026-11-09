@@ -43,6 +43,10 @@ let
     openssl = "${pkgs.openssl}/bin/openssl";
     ssh_ca_key_file = if cfg.sshCA.enable then cfg.sshCA.privateKeyFile else "";
     ssh_cert_minutes = cfg.sshCA.certificateMinutes;
+    deploy_token_file = if cfg.deploy.enable then cfg.deploy.tokenFile else "";
+    deploy_env = cfg.deploy.env;
+    deploy_principal = cfg.deploy.principal;
+    deploy_max_hours = cfg.deploy.maxHours;
     secrets_env = cfg.secrets.env;
     secrets_token_file = if cfg.secrets.tokenFile == null then "" else cfg.secrets.tokenFile;
     secrets_cache = "/run/orchard/secrets";
@@ -206,6 +210,47 @@ in
         type = lib.types.int;
         default = 60;
         description = "Validity of each certificate; the image re-mints on use when it has lapsed.";
+      };
+    };
+
+    deploy = {
+      enable = lib.mkEnableOption ''
+        the deploy window: while a workspace holds an active `ssh` grant for
+        `principal` (always with an expiry, at most `maxHours`), the host
+        reads `env` with the service account in `tokenFile` and pushes those
+        values — and the token itself as OP_SERVICE_ACCOUNT_TOKEN — into the
+        workspace's runtime tmpfs as `deploy.env`, removed again when the
+        grant lapses (`dev sweep`, every few minutes). Requires sshCA
+      '';
+      tokenFile = lib.mkOption {
+        type = lib.types.str;
+        description = ''
+          File holding a 1Password service account token with read access
+          to what deploys need (wider than secrets.tokenFile's account, which
+          every workspace receives). Readable by `user`; never inside a
+          workspace except during an open window.
+        '';
+      };
+      env = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = { PROXMOX_VE_PASSWORD = "op://homelab/pve-root/password"; };
+        description = "Environment variables the window carries, as `op://` references read with `tokenFile`.";
+      };
+      principal = lib.mkOption {
+        type = lib.types.str;
+        default = "deploy";
+        description = "The ssh principal whose grant opens the window (hosts map it to their deploy user).";
+      };
+      maxHours = lib.mkOption {
+        type = lib.types.int;
+        default = 4;
+        description = "Longest `--for` a deploy grant may carry.";
+      };
+      sweepOnCalendar = lib.mkOption {
+        type = lib.types.str;
+        default = "*:0/5";
+        description = "systemd OnCalendar for `dev sweep` (closes lapsed windows, narrows certificates).";
       };
     };
 
@@ -438,6 +483,26 @@ in
       };
     };
 
+    systemd.services.orchard-sweep = lib.mkIf cfg.sshCA.enable {
+      description = "orchard: narrow certificates and close deploy windows as grants expire";
+      after = [ "incus.service" ];
+      requires = [ "incus.service" ];
+      path = [ config.virtualisation.incus.package pkgs.openssh ] ++ lib.optional cfg.deploy.enable cfg.secrets.package;
+      serviceConfig = {
+        Type = "oneshot";
+        User = cfg.user;
+        Group = cfg.user;
+        ExecStart = "${cfg.package}/bin/dev sweep";
+      };
+    };
+    systemd.timers.orchard-sweep = lib.mkIf cfg.sshCA.enable {
+      wantedBy = [ "timers.target" ];
+      timerConfig = {
+        OnBootSec = "3min";
+        OnCalendar = cfg.deploy.sweepOnCalendar;
+        Persistent = true;
+      };
+    };
     systemd.services.orchard-secrets = lib.mkIf (cfg.secrets.env != { }) {
       description = "orchard: refresh the secrets cache and push it into running workspaces";
       after = [ "incus.service" "network-online.target" ];

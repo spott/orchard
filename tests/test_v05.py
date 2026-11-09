@@ -1,46 +1,14 @@
 """0.5: ssh grants and certificates (`dev grant --kind ssh`, `dev token ssh`)."""
 
 import os
-import subprocess
 from datetime import timedelta
 
 import pytest
 
-from orchard import OrchardError, workspace
+from orchard import OrchardError
 from orchard.workspace import KEY
 
 from .conftest import FROZEN
-
-
-@pytest.fixture
-def ca_cfg(cfg, tmp_path):
-    ca = tmp_path / "ca"
-    ca.write_text("FAKE CA PRIVATE KEY\n")
-    cfg.ssh_ca_key_file = str(ca)
-    cfg.ssh_keygen = "ssh-keygen"
-    return cfg
-
-
-@pytest.fixture
-def keygen(monkeypatch):
-    """A fake ssh-keygen: writes a key pair for `-t`, a certificate for `-s`;
-    records every argv."""
-    calls: list[list[str]] = []
-
-    def fake(argv, **kw):
-        calls.append(argv)
-        if "-t" in argv:
-            key = argv[argv.index("-f") + 1]
-            open(key, "w").write("PRIVATE\n")
-            open(key + ".pub", "w").write(f"ssh-ed25519 AAAAWS {argv[argv.index('-C') + 1]}\n")
-        elif "-s" in argv:
-            pub = argv[-1]
-            principals = argv[argv.index("-n") + 1]
-            open(pub[: -len(".pub")] + "-cert.pub", "w").write(f"ssh-ed25519-cert-v01@openssh.com AAAACERT {principals}\n")
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    monkeypatch.setattr(workspace.subprocess, "run", fake)
-    return calls
 
 
 def _pushes(inc):
