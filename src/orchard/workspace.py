@@ -1183,7 +1183,10 @@ class Manager:
             return
         d = self.cfg.ssh_cert_dir()
         self.inc.exec(ws.instance, "rm", "-f", f"{d}/{SSH_KEY_NAME}", f"{d}/{SSH_KEY_NAME}-cert.pub", check=False)
-        self.inc.config_unset(ws.instance, KEY + "ssh-principals")
+        if ws.ssh_principals is not None:
+            # Incus refuses to unset a key that is not set (a certificate
+            # minted before 0.6 has none recorded).
+            self.inc.config_unset(ws.instance, KEY + "ssh-principals")
 
     # -- deploy window --------------------------------------------------------
 
