@@ -15,7 +15,7 @@ from datetime import timedelta
 from . import OrchardError, __version__
 from .config import Config
 from .incus import Incus
-from .workspace import Manager, Workspace, active_grants
+from .workspace import Manager, Workspace, active_grants, GRANT_KINDS
 
 
 def _emit(args: argparse.Namespace, data: Any, human: str) -> None:
@@ -158,14 +158,27 @@ def _permissions(spec: str | None) -> dict[str, str] | None:
     return out
 
 
+def _kind_value(args: argparse.Namespace) -> tuple[str, str]:
+    """`ssh:printers` / `github:spott/iac` name their kind in the value, the
+    way `dev ls` prints grants; `--kind` is the long form (some ssh clients
+    — Blink — eat `--options` after the host, so the prefix needs no flag)."""
+    kind, value = args.kind, args.value
+    head, sep, rest = value.partition(":")
+    if sep and head in GRANT_KINDS and "/" not in head:
+        kind, value = head, rest
+    return kind, value
+
+
 def cmd_grant(mgr: Manager, args: argparse.Namespace) -> int:
-    ws = mgr.grant(args.name, args.kind, args.value, permissions=_permissions(args.permissions), expires=_expiry(mgr, args.for_))
+    kind, value = _kind_value(args)
+    ws = mgr.grant(args.name, kind, value, permissions=_permissions(args.permissions), expires=_expiry(mgr, args.for_))
     _emit(args, ws.as_dict(), f"{ws.name} grants: {_grants_cell(ws)}")
     return 0
 
 
 def cmd_revoke(mgr: Manager, args: argparse.Namespace) -> int:
-    ws = mgr.revoke(args.name, args.kind, args.value)
+    kind, value = _kind_value(args)
+    ws = mgr.revoke(args.name, kind, value)
     _emit(args, ws.as_dict(), f"{ws.name} grants: {_grants_cell(ws)}")
     return 0
 
@@ -258,14 +271,14 @@ def build_parser() -> argparse.ArgumentParser:
     add("proxy", cmd_proxy, "front-door path: ensure running, then relay stdio to its sshd").add_argument("host")
     gr = add("grant", cmd_grant, "let a workspace reach something (github: a repository; ssh: a principal); tokens follow on the next mint")
     gr.add_argument("name")
-    gr.add_argument("value", help="github: owner/repo, or repo under the configured owner; ssh: a principal such as ro, printers, deploy")
-    gr.add_argument("--kind", default="github")
+    gr.add_argument("value", help="github: owner/repo, or repo under the configured owner; ssh: a principal such as ro, printers, deploy. `ssh:printers` / `github:iac` name the kind in the value")
+    gr.add_argument("--kind", default="github", choices=sorted(GRANT_KINDS))
     gr.add_argument("--for", dest="for_", metavar="DURATION", help="expire after 30m, 2h, 3d, or at an ISO timestamp")
     gr.add_argument("--permissions", help="narrow the token: contents=read,pull_requests=write,...")
     rv = add("revoke", cmd_revoke, "take a grant away and revoke the workspace's live tokens")
     rv.add_argument("name")
-    rv.add_argument("value")
-    rv.add_argument("--kind", default="github")
+    rv.add_argument("value", help="as for grant; `ssh:printers` names the kind in the value")
+    rv.add_argument("--kind", default="github", choices=sorted(GRANT_KINDS))
     t = add("token", cmd_token, "mint (or reuse) a short-lived token limited to the workspace's grants")
     t.add_argument("kind", choices=["github", "ssh"])
     t.add_argument("name")

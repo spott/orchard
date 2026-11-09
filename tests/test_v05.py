@@ -121,3 +121,23 @@ def test_ssh_grants_survive_rebase_and_fork_mints_afresh(mgr, ca_cfg, inc, keyge
     assert [(g["kind"], g["value"]) for g in child.grants] == [("ssh", "ro")]
     assert [a for a in keygen if "-s" in a and a[a.index("-I") + 1] == "ws:bar"], "the fork got its own certificate"
     assert KEY + "grants" in inc.inst["bar"]["config"]
+
+
+def test_grant_value_may_name_its_kind(mgr, ca_cfg, inc, keygen, capsys):
+    from orchard import cli
+
+    mgr.create("foo")
+    inc.inst["foo"]["config"][KEY + "grants"] = '[{"kind":"github","value":"spott/iac","permissions":null,"expires":null,"by":"t","at":"x"}]'
+    # `ssh:ro` needs no --kind; a github token revoke is NOT triggered by an ssh grant.
+    args = cli.build_parser().parse_args(["grant", "foo", "ssh:ro"])
+    inc.calls.clear()
+    assert cli.cmd_grant(mgr, args) == 0
+    ws = mgr.require("foo")
+    assert [(g["kind"], g["value"]) for g in ws.grants] == [("github", "spott/iac"), ("ssh", "ro")]
+    args = cli.build_parser().parse_args(["revoke", "foo", "ssh:ro"])
+    assert cli.cmd_revoke(mgr, args) == 0
+    assert [(g["kind"], g["value"]) for g in mgr.require("foo").grants] == [("github", "spott/iac")]
+    # A plain repo keeps meaning github, and `github:` is accepted too.
+    args = cli.build_parser().parse_args(["revoke", "foo", "github:spott/iac"])
+    assert cli.cmd_revoke(mgr, args) == 0
+    assert mgr.require("foo").grants == []
