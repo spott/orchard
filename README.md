@@ -82,7 +82,7 @@ What a workspace may reach is a list of **grants** on its manifest
 (`user.orchard.grants`, JSON: kind, value, optional permissions and expiry,
 who granted it and when). Grants are data, never derived from the name at
 request time: a workspace that renames itself to `iac` does not become iac.
-Forks inherit the parent's grants. Today's only kind is `github`.
+Forks inherit the parent's grants. Kinds: `github` (a repository) and `ssh` (a certificate principal, below).
 
 ```
 dev grant blah.iac orchard                      # + spott/orchard (owner from config)
@@ -123,6 +123,35 @@ bare name is never refused: it clones when the (cached) list has a
 repository of that name and is a plain workspace otherwise — including when
 the list cannot be fetched at all, so a GitHub outage degrades to "no clone",
 not "no workspace".
+
+## Grants and ssh certificates
+
+With `services.orchard.sshCA` the host holds an **ssh user CA** and signs,
+per workspace, a short-lived **certificate** (default one hour) for the
+**principals** in its active `ssh` grants. Principals are roles the hosts
+map to users themselves (`TrustedUserCAKeys` + `AuthorizedPrincipalsFile`):
+for example `ro` → a read-only user everywhere, `printers` → `ops` on the
+printer hosts, `deploy` → `ops` on every host. Which principal reaches what
+is the fleet's business; orchard only signs what was granted.
+
+```
+dev grant blah.iac --kind ssh ro                 # diagnose anywhere
+dev grant blah.iac --kind ssh printers --for 4h  # operate one host group, for a while
+dev grant iac --kind ssh deploy --for 2h         # the time-boxed deploy window
+dev revoke blah.iac --kind ssh printers          # certificate dropped at once
+dev token ssh blah.iac                           # operator; `dev token ssh` from inside
+```
+
+The key pair is generated on the host, signed (`ssh-keygen -s`, identity
+`ws:<name>` so the target's sshd log names the workspace), pushed into
+`/run/user/<uid>/orchard/ssh/id_ed25519{,-cert.pub}` and forgotten; the CA
+key never leaves the host. A workspace with ssh grants gets a certificate
+when `dev` starts it and whenever a grant changes; the image's ssh config
+points at the files and re-mints through `dev token ssh` when the
+certificate has lapsed, so an agent just runs `ssh ro@host`. Nothing is on
+the volume: a stopped or rebased workspace holds no certificate, and a fork
+inherits grants but is minted afresh. Revoking a grant drops the live
+certificate; sessions already open stay open until they end.
 
 ## Secrets at start
 

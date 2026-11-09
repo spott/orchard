@@ -29,7 +29,8 @@ def _grants_cell(ws: Workspace) -> str:
     cells = []
     for g in ws.grants:
         live = g in active_grants(ws.grants)
-        cells.append(f"{g['value']}{'' if live else ' (expired)'}")
+        label = g["value"] if g.get("kind") == "github" else f"{g.get('kind')}:{g['value']}"
+        cells.append(f"{label}{'' if live else ' (expired)'}")
     return ",".join(cells) or "-"
 
 
@@ -171,6 +172,9 @@ def cmd_revoke(mgr: Manager, args: argparse.Namespace) -> int:
 
 def cmd_token(mgr: Manager, args: argparse.Namespace) -> int:
     tok = mgr.token(args.name, args.kind)
+    if args.kind == "ssh":
+        _emit(args, tok, f"{tok['workspace']}: certificate for {', '.join(tok['principals'])} until {tok['expires']} at {tok['certificate']}")
+        return 0
     if args.git:
         # git credential helper protocol (`get`): the token is the password.
         print(f"username=x-access-token\npassword={tok['token']}")
@@ -252,9 +256,9 @@ def build_parser() -> argparse.ArgumentParser:
     u = add("update", cmd_update, "re-lock project flakes under ~/work to the image's nixpkgs")
     u.add_argument("names", nargs="*", help="workspaces (default: every running one)")
     add("proxy", cmd_proxy, "front-door path: ensure running, then relay stdio to its sshd").add_argument("host")
-    gr = add("grant", cmd_grant, "let a workspace reach something (github: a repository); tokens follow on the next mint")
+    gr = add("grant", cmd_grant, "let a workspace reach something (github: a repository; ssh: a principal); tokens follow on the next mint")
     gr.add_argument("name")
-    gr.add_argument("value", help="github: owner/repo, or repo under the configured owner")
+    gr.add_argument("value", help="github: owner/repo, or repo under the configured owner; ssh: a principal such as ro, printers, deploy")
     gr.add_argument("--kind", default="github")
     gr.add_argument("--for", dest="for_", metavar="DURATION", help="expire after 30m, 2h, 3d, or at an ISO timestamp")
     gr.add_argument("--permissions", help="narrow the token: contents=read,pull_requests=write,...")
@@ -263,7 +267,7 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("value")
     rv.add_argument("--kind", default="github")
     t = add("token", cmd_token, "mint (or reuse) a short-lived token limited to the workspace's grants")
-    t.add_argument("kind", choices=["github"])
+    t.add_argument("kind", choices=["github", "ssh"])
     t.add_argument("name")
     t.add_argument("--git", action="store_true", help="print it in git credential-helper form")
     sc = add("secrets", cmd_secrets, "the secrets every workspace gets at start: refresh the cache, push, list")
