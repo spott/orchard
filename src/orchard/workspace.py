@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import ipaddress
 import json
+import re
 import os
 import shutil
 import socket
@@ -32,7 +33,10 @@ KEY = "user.orchard."
 WORK_DEVICE = "work"
 LOGINS_DEVICE = "logins"
 NIC_DEVICE = "eth0"
-GRANT_KINDS = {"github"}
+GRANT_KINDS = {"github", "ssh"}
+# An ssh certificate principal (the role a grant conveys: ro, printers, deploy).
+PRINCIPAL_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
+SSH_KEY_NAME = "id_ed25519"
 # How long `dev` waits for the workspace user's runtime tmpfs (/run/user/<uid>,
 # made by logind for the lingering user) before pushing secrets into it.
 RUNTIME_DIR_TRIES = 40
@@ -933,6 +937,7 @@ class Manager:
             raise
         self._install_self(ws)
         self._push_secrets(ws)
+        self._push_ssh_cert(ws)
         if clone_repo:
             self._clone(ws, clone_repo)
         self._hook("on_create", ws)
@@ -953,6 +958,7 @@ class Manager:
         # gets them the next time dev starts it, a running one on `dev start`.
         self._attach_logins(ws.instance)
         self._push_secrets(ws)
+        self._push_ssh_cert(ws)
         return ws
 
     # -- grants and tokens ----------------------------------------------------
@@ -964,6 +970,10 @@ class Manager:
             raise OrchardError(f"unknown grant kind {kind!r} (one of: {', '.join(sorted(GRANT_KINDS))})")
         if kind == "github":
             value = self._full_repo(value)
+        elif kind == "ssh":
+            value = value.strip()
+            if not PRINCIPAL_RE.fullmatch(value):
+                raise OrchardError(f"{value!r}: an ssh principal is lowercase letters, digits and dashes (ro, printers, deploy)")
         return {
             "kind": kind, "value": value, "permissions": permissions or None, "expires": expires,
             "by": by, "at": self.now().isoformat(timespec="seconds"),
@@ -1026,6 +1036,9 @@ class Manager:
             ws = self._set_grants(ws, kept + [new])
             # A cached token may be wider or narrower than the new list.
             self._revoke_tokens(name)
+            if kind == "ssh":
+                # Takes effect now, not at the next connection's re-mint.
+                self._push_ssh_cert(ws)
             return ws
 
     def revoke(self, name: str, kind: str, value: str) -> Workspace:
@@ -1040,11 +1053,17 @@ class Manager:
             self.log(f"revoking {kind} {value} from {name}")
             ws = self._set_grants(ws, kept)
             self._revoke_tokens(name)
+            if kind == "ssh":
+                # Drop the live certificate; a narrower one follows if grants remain.
+                self._drop_ssh_cert(ws)
+                self._push_ssh_cert(ws)
             return ws
 
     def token(self, name: str, kind: str = "github") -> dict[str, Any]:
         """A fresh (or cached, unexpired) token for the workspace, limited to
         its active grants of that kind."""
+        if kind == "ssh":
+            return self._mint_ssh(self.require(name))
         if kind != "github":
             raise OrchardError(f"unknown token kind {kind!r}")
         if self.github is None:
@@ -1067,6 +1086,75 @@ class Manager:
                 permissions[k] = "write" if "write" in (v, permissions.get(k)) else v
         tok = self.github.token(name, repos, permissions)
         return {**tok, "workspace": name}
+
+    # -- ssh certificates ---------------------------------------------------
+
+    def _ssh_principals(self, ws: Workspace) -> list[str]:
+        return sorted({g["value"] for g in active_grants(ws.grants, self.now()) if g.get("kind") == "ssh"})
+
+    def _mint_ssh(self, ws: Workspace) -> dict[str, Any]:
+        """Sign a fresh ed25519 key for the workspace's active ssh principals
+        and push key + certificate into its runtime tmpfs. The private key is
+        generated on the host, pushed once, and deleted here: it only ever
+        speaks for this workspace, for `ssh_cert_minutes`. The identity
+        `ws:<name>` is what sshd on the target logs."""
+        cfg = self.cfg
+        if not cfg.ssh_ca_enabled():
+            raise OrchardError("ssh certificates are not configured on this host (services.orchard.sshCA)")
+        principals = self._ssh_principals(ws)
+        if not principals:
+            raise OrchardError(f"{ws.name} has no active ssh grants")
+        if not ws.running:
+            raise OrchardError(f"{ws.name} is not running; a certificate lives in its runtime tmpfs")
+        if not self._runtime_dir_ready(ws.instance):
+            raise OrchardError(f"/run/user/{cfg.uid} never appeared in {ws.name}")
+        identity = f"ws:{ws.name}"
+        expires = self.now() + timedelta(minutes=cfg.ssh_cert_minutes)
+        tmp = tempfile.mkdtemp(prefix="orchard-cert-")
+        try:
+            key = os.path.join(tmp, SSH_KEY_NAME)
+            self._keygen(["-q", "-t", "ed25519", "-N", "", "-C", identity, "-f", key])
+            self._keygen([
+                "-q", "-s", cfg.ssh_ca_key_file, "-I", identity, "-n", ",".join(principals),
+                "-V", f"+{cfg.ssh_cert_minutes}m", key + ".pub",
+            ])
+            cert = key + "-cert.pub"
+            dst_dir = cfg.ssh_cert_dir()
+            self.inc.file_push(key, ws.instance, f"{dst_dir}/{SSH_KEY_NAME}", uid=cfg.uid, gid=cfg.gid, mode="0600")
+            self.inc.file_push(cert, ws.instance, f"{dst_dir}/{SSH_KEY_NAME}-cert.pub", uid=cfg.uid, gid=cfg.gid, mode="0644")
+            self.inc.exec(ws.instance, "chown", f"{cfg.uid}:{cfg.gid}", cfg.secrets_path(), dst_dir, check=False)
+            self.inc.exec(ws.instance, "chmod", "0700", cfg.secrets_path(), dst_dir, check=False)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+        self.log(f"{ws.name}: ssh certificate for {', '.join(principals)} until {expires.isoformat(timespec='minutes')}")
+        return {
+            "workspace": ws.name, "principals": principals, "identity": identity,
+            "expires": expires.isoformat(timespec="seconds"),
+            "key": f"{dst_dir}/{SSH_KEY_NAME}", "certificate": f"{dst_dir}/{SSH_KEY_NAME}-cert.pub",
+        }
+
+    def _keygen(self, argv: list[str]) -> None:
+        proc = subprocess.run(
+            [self.cfg.ssh_keygen, *argv], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        )
+        if proc.returncode != 0:
+            raise OrchardError(f"ssh-keygen failed: {proc.stderr.strip()}")
+
+    def _push_ssh_cert(self, ws: Workspace) -> None:
+        """At start (and on grant): a certificate for whatever ssh grants are
+        active, if any. Never fails the start."""
+        if not self.cfg.ssh_ca_enabled() or not ws.running or not self._ssh_principals(ws):
+            return
+        try:
+            self._mint_ssh(ws)
+        except (OrchardError, IncusError) as e:
+            self.log(f"warning: no ssh certificate for {ws.name}: {e}")
+
+    def _drop_ssh_cert(self, ws: Workspace) -> None:
+        if not ws.running:
+            return
+        d = self.cfg.ssh_cert_dir()
+        self.inc.exec(ws.instance, "rm", "-f", f"{d}/{SSH_KEY_NAME}", f"{d}/{SSH_KEY_NAME}-cert.pub", check=False)
 
     def _revoke_tokens(self, name: str) -> None:
         if self.github is None:

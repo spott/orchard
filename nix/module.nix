@@ -41,6 +41,8 @@ let
     github_api = cfg.github.apiUrl;
     github_default_permissions = cfg.github.defaultPermissions;
     openssl = "${pkgs.openssl}/bin/openssl";
+    ssh_ca_key_file = if cfg.sshCA.enable then cfg.sshCA.privateKeyFile else "";
+    ssh_cert_minutes = cfg.sshCA.certificateMinutes;
     secrets_env = cfg.secrets.env;
     secrets_token_file = if cfg.secrets.tokenFile == null then "" else cfg.secrets.tokenFile;
     secrets_cache = "/run/orchard/secrets";
@@ -180,6 +182,30 @@ in
           creates, `dev grant` without --permissions). A token carries the
           union over the workspace's grants. `{ }` = the App's full set.
         '';
+      };
+    };
+
+    sshCA = {
+      enable = lib.mkEnableOption ''
+        per-workspace ssh certificates: orchard holds an ssh user CA and
+        `dev token ssh` signs a short-lived certificate for the principals in
+        a workspace's `ssh` grants (`dev grant NAME --kind ssh ro`), pushed
+        into the workspace's runtime tmpfs next to the secrets env
+      '';
+      privateKeyFile = lib.mkOption {
+        type = lib.types.str;
+        description = ''
+          Path to the CA's private key (OpenSSH format), deployed out of band
+          (a Colmena/agenix/sops key), readable by `user`. Every host that
+          should accept the certificates trusts the public half
+          (`TrustedUserCAKeys`) and maps principals to users
+          (`AuthorizedPrincipalsFile`). Never inside a workspace.
+        '';
+      };
+      certificateMinutes = lib.mkOption {
+        type = lib.types.int;
+        default = 60;
+        description = "Validity of each certificate; the image re-mints on use when it has lapsed.";
       };
     };
 

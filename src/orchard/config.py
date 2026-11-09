@@ -56,6 +56,11 @@ class Config:
     self_host: str = ""
     self_hostkey_file: str = "/etc/ssh/ssh_host_ed25519_key.pub"
     ssh_keygen: str = "ssh-keygen"
+    # ssh user CA (OpenSSH private key on the host): `dev token ssh` signs a
+    # short-lived certificate for the principals in a workspace's `ssh`
+    # grants and pushes key + certificate into its tmpfs. Empty = off.
+    ssh_ca_key_file: str = ""
+    ssh_cert_minutes: int = 60
     # The wake resolver (`orchard-dns`): a lookup of `<name>.<zone>` starts
     # a stopped workspace, or creates a missing one when dns_create is set.
     dns_listen: str = ""
@@ -121,3 +126,10 @@ class Config:
 
     def github_enabled(self) -> bool:
         return bool(self.github_app_id and self.github_key_file and self.github_owner)
+
+    def ssh_ca_enabled(self) -> bool:
+        return bool(self.ssh_ca_key_file)
+
+    def ssh_cert_dir(self) -> str:
+        """Where a workspace's ssh certificate lands: next to the secrets env."""
+        return f"{self.secrets_path()}/ssh"
