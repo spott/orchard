@@ -153,6 +153,31 @@ the volume: a stopped or rebased workspace holds no certificate, and a fork
 inherits grants but is minted afresh. Revoking a grant drops the live
 certificate; sessions already open stay open until they end.
 
+## Kubernetes
+
+With `services.orchard.k8s` a `k8s:<role>` grant gives a workspace a
+`kubectl` that works, with nothing long-lived inside it. A **role** is one
+ServiceAccount in one namespace, from the host's catalog (`k8s.roles`); what
+it can do is that account's RBAC in the cluster, which orchard does not
+manage. The host holds a **minter** token whose only right is creating
+tokens for those accounts.
+
+```
+dev grant blah.mcps k8s:mcp          # a context `mcp` appears in the workspace's kubeconfig
+dev grant iac k8s:cluster-view --for 8h
+dev revoke blah.mcps k8s:mcp         # context gone, cached token dropped
+dev token k8s blah.mcps mcp          # operator; `dev token k8s [role]` from inside
+```
+
+The kubeconfig is `/run/user/<uid>/orchard/kubeconfig` (the image points
+`KUBECONFIG` at it): one context per active role, default namespace the
+role's, and as its user a credential plugin, `dev token k8s <role> --exec`.
+Each `kubectl` call asks the host, which answers from a per-workspace cache
+or with a fresh TokenRequest (`k8s.tokenMinutes`, default an hour). The file
+itself holds no secret. A bound token cannot be recalled: a revoked or
+expired grant stops the next mint at once, and a token already handed out
+lives out its hour.
+
 ## The deploy window
 
 Changing the lab (a Colmena switch, a Proxmox snapshot) needs more than a

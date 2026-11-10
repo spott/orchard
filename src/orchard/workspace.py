@@ -28,13 +28,14 @@ from . import OrchardError, locks, names
 from .config import Config
 from .github import GitHub
 from .incus import Incus, IncusError
+from .k8s import K8s
 from .secrets import ENV_FILE, Secrets
 
 KEY = "user.orchard."
 WORK_DEVICE = "work"
 LOGINS_DEVICE = "logins"
 NIC_DEVICE = "eth0"
-GRANT_KINDS = {"github", "ssh"}
+GRANT_KINDS = {"github", "ssh", "k8s"}
 # An ssh certificate principal (the role a grant conveys: ro, printers, deploy).
 PRINCIPAL_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 SSH_KEY_NAME = "id_ed25519"
@@ -161,6 +162,8 @@ class Workspace:
     # and the expiry of the deploy window whose env file is in place.
     ssh_principals: str | None = None
     deploy: str | None = None
+    # Roles in the kubeconfig last pushed (`sweep` rewrites it on change).
+    k8s_roles: str | None = None
     # When `gc` first saw someone logged into this lookup-created workspace.
     # Login evidence lives in the instance's journal, which a rebase does not
     # carry over; this stamp is metadata, so it does.
@@ -253,6 +256,7 @@ def from_instance(inst: dict[str, Any]) -> Workspace:
         rebased=cfg.get(KEY + "rebased"),
         used=cfg.get(KEY + "used"),
         ssh_principals=cfg.get(KEY + "ssh-principals"),
+        k8s_roles=cfg.get(KEY + "k8s-roles"),
         deploy=cfg.get(KEY + "deploy"),
         instance=inst["name"],
         grants=parse_grants(cfg.get(KEY + "grants")),
@@ -285,6 +289,7 @@ class Manager:
         now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
         github: GitHub | None = None,
         secrets: Secrets | None = None,
+        k8s: K8s | None = None,
     ) -> None:
         self.cfg = cfg
         self.inc = inc
@@ -294,6 +299,7 @@ class Manager:
         self.now = now
         self.github = github or (GitHub(cfg, log=self.log) if cfg.github_enabled() else None)
         self.secrets = secrets or Secrets(cfg, log=self.log)
+        self.k8s = k8s or (K8s(cfg, log=self.log) if cfg.k8s_enabled() else None)
         self._warned_no_cache = False
 
     # -- read side ----------------------------------------------------------
@@ -947,6 +953,7 @@ class Manager:
         self._push_secrets(ws)
         self._push_ssh_cert(ws)
         self._push_deploy(ws, fresh=True)
+        self._push_kubeconfig(ws)
         if clone_repo:
             self._clone(ws, clone_repo)
         self._hook("on_create", ws)
@@ -969,6 +976,7 @@ class Manager:
         self._push_secrets(ws)
         self._push_ssh_cert(ws)
         self._push_deploy(ws, fresh=True)
+        self._push_kubeconfig(ws)
         return ws
 
     # -- grants and tokens ----------------------------------------------------
@@ -995,6 +1003,11 @@ class Manager:
                     until = until.replace(tzinfo=timezone.utc)
                 if until - self.now() > limit:
                     raise OrchardError(f"ssh:{value}: the deploy window is at most {self.cfg.deploy_max_hours}h")
+        elif kind == "k8s":
+            value = value.strip()
+            if self.k8s is None:
+                raise OrchardError("k8s grants are not configured on this host (services.orchard.k8s)")
+            self.k8s.role(value)  # must be in the catalog
         return {
             "kind": kind, "value": value, "permissions": permissions or None, "expires": expires,
             "by": by, "at": self.now().isoformat(timespec="seconds"),
@@ -1063,6 +1076,9 @@ class Manager:
                 self._push_ssh_cert(ws)
                 self._push_deploy(ws)
                 ws = self.require(name)  # the pushes recorded more metadata
+            if kind == "k8s":
+                self._push_kubeconfig(ws)
+                ws = self.require(name)
             return ws
 
     def revoke(self, name: str, kind: str, value: str) -> Workspace:
@@ -1084,13 +1100,20 @@ class Manager:
                 self._push_ssh_cert(ws)
                 self._push_deploy(ws)
                 ws = self.require(name)
+            if kind == "k8s":
+                if self.k8s is not None:
+                    self.k8s.forget(name, value)
+                self._push_kubeconfig(ws)
+                ws = self.require(name)
             return ws
 
-    def token(self, name: str, kind: str = "github") -> dict[str, Any]:
+    def token(self, name: str, kind: str = "github", role: str | None = None) -> dict[str, Any]:
         """A fresh (or cached, unexpired) token for the workspace, limited to
-        its active grants of that kind."""
+        its active grants of that kind. `role` picks among k8s grants."""
         if kind == "ssh":
             return self._mint_ssh(self.require(name))
+        if kind == "k8s":
+            return self._mint_k8s(self.require(name), role)
         if kind != "github":
             raise OrchardError(f"unknown token kind {kind!r}")
         if self.github is None:
@@ -1113,6 +1136,63 @@ class Manager:
                 permissions[k] = "write" if "write" in (v, permissions.get(k)) else v
         tok = self.github.token(name, repos, permissions)
         return {**tok, "workspace": name}
+
+    # -- kubernetes ----------------------------------------------------------
+
+    def _k8s_roles(self, ws: Workspace) -> list[str]:
+        return sorted({g["value"] for g in active_grants(ws.grants, self.now()) if g.get("kind") == "k8s"})
+
+    def _mint_k8s(self, ws: Workspace, role: str | None) -> dict[str, Any]:
+        if self.k8s is None:
+            raise OrchardError("k8s tokens are not configured on this host (services.orchard.k8s)")
+        roles = self._k8s_roles(ws)
+        if not roles:
+            raise OrchardError(f"{ws.name} has no active k8s grants")
+        if role is None:
+            if len(roles) > 1:
+                raise OrchardError(f"{ws.name} has several k8s grants; name one of: {', '.join(roles)}")
+            role = roles[0]
+        elif role not in roles:
+            raise OrchardError(f"{ws.name} has no active k8s grant for {role!r}")
+        tok = self.k8s.token(ws.name, role)
+        return {k: v for k, v in tok.items() if k != "expires_epoch"} | {"workspace": ws.name}
+
+    def _push_kubeconfig(self, ws: Workspace) -> None:
+        """Make the workspace's kubeconfig name exactly its active k8s roles
+        (one context each, no secret inside); no roles, no file."""
+        if self.k8s is None or not ws.running:
+            return
+        cfg = self.cfg
+        roles = [r for r in self._k8s_roles(ws) if r in cfg.k8s_roles]
+        have = [r for r in (ws.k8s_roles or "").split(",") if r]
+        dst = cfg.kubeconfig_path()
+        try:
+            if not roles:
+                if ws.k8s_roles is not None:
+                    self.inc.exec(ws.instance, "rm", "-f", dst, check=False)
+                    self.inc.config_unset(ws.instance, KEY + "k8s-roles")
+                    self.k8s.forget(ws.name)
+                return
+            if not self._runtime_dir_ready(ws.instance):
+                self.log(f"warning: /run/user/{cfg.uid} never appeared in {ws.name}; kubeconfig not pushed")
+                return
+            tmp = tempfile.mkdtemp(prefix="orchard-kube-")
+            try:
+                src = os.path.join(tmp, "kubeconfig")
+                with open(src, "w") as f:
+                    f.write(self.k8s.kubeconfig(roles, cfg.client_path()))
+                self.inc.file_push(src, ws.instance, dst, uid=cfg.uid, gid=cfg.gid, mode="0600")
+                self.inc.exec(ws.instance, "chown", f"{cfg.uid}:{cfg.gid}", cfg.secrets_path(), check=False)
+                self.inc.exec(ws.instance, "chmod", "0700", cfg.secrets_path(), check=False)
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
+            for gone in set(have) - set(roles):
+                self.k8s.forget(ws.name, gone)
+            if have != roles:
+                self.inc.config_set(ws.instance, {KEY + "k8s-roles": ",".join(roles)})
+                self.log(f"{ws.name}: kubeconfig for {', '.join(roles)}")
+        except (IncusError, OSError) as e:
+            self.log(f"warning: no kubeconfig for {ws.name}: {e}")
 
     # -- ssh certificates ---------------------------------------------------
 
@@ -1266,6 +1346,9 @@ class Manager:
                 self._drop_ssh_cert(ws)
                 self._push_ssh_cert(ws)
                 touched.append(ws.name)
+            if self.k8s is not None and [r for r in (ws.k8s_roles or "").split(",") if r] != self._k8s_roles(ws):
+                self._push_kubeconfig(ws)
+                touched.append(ws.name)
             before = ws.deploy
             self._push_deploy(ws)
             if self.require(ws.name).deploy != before and ws.name not in touched:
@@ -1273,6 +1356,8 @@ class Manager:
         return touched
 
     def _revoke_tokens(self, name: str) -> None:
+        if self.k8s is not None:
+            self.k8s.forget(name)
         if self.github is None:
             return
         try:
@@ -1441,7 +1526,7 @@ class Manager:
             client = os.path.join(tmp, "dev")
             with open(client, "w") as f:
                 f.write(SELF_CLIENT.format(host=cfg.self_host))
-            self.inc.file_push(client, ws.instance, f"/home/{cfg.user}/.local/bin/dev", uid=cfg.uid, gid=cfg.gid, mode="0755")
+            self.inc.file_push(client, ws.instance, cfg.client_path(), uid=cfg.uid, gid=cfg.gid, mode="0755")
         except IncusError as e:
             self.log(f"warning: could not update the dev client in {ws.name}: {e}")
         finally:

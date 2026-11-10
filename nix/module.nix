@@ -43,6 +43,11 @@ let
     openssl = "${pkgs.openssl}/bin/openssl";
     ssh_ca_key_file = if cfg.sshCA.enable then cfg.sshCA.privateKeyFile else "";
     ssh_cert_minutes = cfg.sshCA.certificateMinutes;
+    k8s_server = if cfg.k8s.enable then cfg.k8s.server else "";
+    k8s_ca_file = if cfg.k8s.enable then "${cfg.k8s.caFile}" else "";
+    k8s_token_file = if cfg.k8s.enable then cfg.k8s.tokenFile else "";
+    k8s_roles = cfg.k8s.roles;
+    k8s_token_minutes = cfg.k8s.tokenMinutes;
     deploy_token_file = if cfg.deploy.enable then cfg.deploy.tokenFile else "";
     deploy_env = cfg.deploy.env;
     deploy_files = cfg.deploy.files;
@@ -212,6 +217,50 @@ in
         type = lib.types.int;
         default = 60;
         description = "Validity of each certificate; the image re-mints on use when it has lapsed.";
+      };
+    };
+
+    k8s = {
+      enable = lib.mkEnableOption ''
+        Kubernetes access for workspaces: a `k8s:<role>` grant
+        (`dev grant NAME k8s:mcp`) puts a context for that role into the
+        workspace's kubeconfig (/run/user/<uid>/orchard/kubeconfig), whose
+        credential plugin is `dev token k8s <role> --exec`; the host answers
+        with a short-lived ServiceAccount token from the TokenRequest API
+      '';
+      server = lib.mkOption {
+        type = lib.types.str;
+        example = "https://k3s.example.com:6443";
+        description = "API server URL, as both the host and the workspaces reach it.";
+      };
+      caFile = lib.mkOption {
+        type = lib.types.path;
+        description = "The cluster's CA certificate (public); verified by the host and embedded in each kubeconfig.";
+      };
+      tokenFile = lib.mkOption {
+        type = lib.types.str;
+        description = ''
+          File holding the minter's token: a ServiceAccount whose only right
+          is `create` on `serviceaccounts/token` for the accounts named in
+          `roles`. Deployed out of band, readable by `user`, never inside a
+          workspace.
+        '';
+      };
+      roles = lib.mkOption {
+        type = lib.types.attrsOf (lib.types.submodule {
+          options = {
+            namespace = lib.mkOption { type = lib.types.str; description = "Namespace of the ServiceAccount; also the context's default namespace."; };
+            serviceAccount = lib.mkOption { type = lib.types.str; description = "The ServiceAccount whose tokens this role hands out."; };
+          };
+        });
+        default = { };
+        example = { mcp = { namespace = "mcp"; serviceAccount = "orchard-view"; }; };
+        description = "The role catalog: what `k8s:<role>` may name. What a role can do is its ServiceAccount's RBAC in the cluster.";
+      };
+      tokenMinutes = lib.mkOption {
+        type = lib.types.ints.between 10 1440;
+        default = 60;
+        description = "Lifetime of each token (the API's minimum is 10 minutes). A revoked grant's tokens live this long at most.";
       };
     };
 
@@ -496,8 +545,8 @@ in
       };
     };
 
-    systemd.services.orchard-sweep = lib.mkIf cfg.sshCA.enable {
-      description = "orchard: narrow certificates and close deploy windows as grants expire";
+    systemd.services.orchard-sweep = lib.mkIf (cfg.sshCA.enable || cfg.k8s.enable) {
+      description = "orchard: narrow certificates and kubeconfigs, close deploy windows as grants expire";
       after = [ "incus.service" ];
       requires = [ "incus.service" ];
       path = [ config.virtualisation.incus.package pkgs.openssh ] ++ lib.optional cfg.deploy.enable cfg.secrets.package;
@@ -508,7 +557,7 @@ in
         ExecStart = "${cfg.package}/bin/dev sweep";
       };
     };
-    systemd.timers.orchard-sweep = lib.mkIf cfg.sshCA.enable {
+    systemd.timers.orchard-sweep = lib.mkIf (cfg.sshCA.enable || cfg.k8s.enable) {
       wantedBy = [ "timers.target" ];
       timerConfig = {
         OnBootSec = "3min";
