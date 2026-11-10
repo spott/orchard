@@ -45,9 +45,11 @@ let
     ssh_cert_minutes = cfg.sshCA.certificateMinutes;
     deploy_token_file = if cfg.deploy.enable then cfg.deploy.tokenFile else "";
     deploy_env = cfg.deploy.env;
+    deploy_files = cfg.deploy.files;
     deploy_principal = cfg.deploy.principal;
     deploy_max_hours = cfg.deploy.maxHours;
     secrets_env = cfg.secrets.env;
+    secrets_files = cfg.secrets.files;
     secrets_token_file = if cfg.secrets.tokenFile == null then "" else cfg.secrets.tokenFile;
     secrets_cache = "/run/orchard/secrets";
     op = "${cfg.secrets.package}/bin/op";
@@ -237,6 +239,12 @@ in
         example = { PROXMOX_VE_PASSWORD = "op://homelab/pve-root/password"; };
         description = "Environment variables the window carries, as `op://` references read with `tokenFile`.";
       };
+      files = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = { nixbuild-key = "op://homelab/nixbuild key/private key?ssh-format=openssh"; };
+        description = "Files the window carries, name -> `op://` reference, at /run/user/<uid>/orchard/deploy/<name> (0600).";
+      };
       principal = lib.mkOption {
         type = lib.types.str;
         default = "deploy";
@@ -269,6 +277,11 @@ in
           stopped workspace holds nothing. The image's shell should source
           that file.
         '';
+      };
+      files = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        description = "Files every workspace gets at start, name -> `op://` reference, at /run/user/<uid>/orchard/files/<name> (0600); cached and pushed like `env`.";
       };
       tokenFile = lib.mkOption {
         type = lib.types.nullOr lib.types.str;
@@ -503,7 +516,7 @@ in
         Persistent = true;
       };
     };
-    systemd.services.orchard-secrets = lib.mkIf (cfg.secrets.env != { }) {
+    systemd.services.orchard-secrets = lib.mkIf (cfg.secrets.env != { } || cfg.secrets.files != { }) {
       description = "orchard: refresh the secrets cache and push it into running workspaces";
       after = [ "incus.service" "network-online.target" ];
       requires = [ "incus.service" ];
@@ -516,7 +529,7 @@ in
         ExecStart = "${cfg.package}/bin/dev secrets refresh";
       };
     };
-    systemd.timers.orchard-secrets = lib.mkIf (cfg.secrets.env != { }) {
+    systemd.timers.orchard-secrets = lib.mkIf (cfg.secrets.env != { } || cfg.secrets.files != { }) {
       wantedBy = [ "timers.target" ];
       timerConfig = {
         OnBootSec = "2min";

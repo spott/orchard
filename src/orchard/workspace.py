@@ -1208,7 +1208,7 @@ class Manager:
         path = f"{cfg.secrets_path()}/{DEPLOY_ENV_FILE}"
         if grant is None:
             if ws.deploy is not None:
-                self.inc.exec(ws.instance, "rm", "-f", path, check=False)
+                self.inc.exec(ws.instance, "rm", "-rf", path, cfg.deploy_files_path(), check=False)
                 self.inc.config_unset(ws.instance, KEY + "deploy")
                 self.log(f"{ws.name}: deploy window closed")
             return
@@ -1217,6 +1217,7 @@ class Manager:
         try:
             token = open(cfg.deploy_token_file).read().strip()
             values = {k: self.secrets.read(ref, token_file=cfg.deploy_token_file) for k, ref in sorted(cfg.deploy_env.items())}
+            files = {n: self.secrets.read(ref, token_file=cfg.deploy_token_file) for n, ref in sorted(cfg.deploy_files.items())}
         except (OSError, OrchardError) as e:
             self.log(f"warning: deploy window for {ws.name} not opened: {e}")
             return
@@ -1231,13 +1232,24 @@ class Manager:
                 for k, v in values.items():
                     f.write(f"{k}={shlex.quote(v)}\n")
             self.inc.file_push(tmp, ws.instance, path, uid=cfg.uid, gid=cfg.gid, mode="0600")
+            for name, content in files.items():
+                fd2, tmp2 = tempfile.mkstemp(prefix="orchard-deploy-file-")
+                try:
+                    with os.fdopen(fd2, "w") as f:
+                        f.write(content)
+                    self.inc.file_push(tmp2, ws.instance, f"{cfg.deploy_files_path()}/{name}", uid=cfg.uid, gid=cfg.gid, mode="0600")
+                finally:
+                    os.unlink(tmp2)
+            if files:
+                self.inc.exec(ws.instance, "chown", f"{cfg.uid}:{cfg.gid}", cfg.deploy_files_path(), check=False)
+                self.inc.exec(ws.instance, "chmod", "0700", cfg.deploy_files_path(), check=False)
         except IncusError as e:
             self.log(f"warning: could not push the deploy env into {ws.name}: {e}")
             return
         finally:
             os.unlink(tmp)
         self.inc.config_set(ws.instance, {KEY + "deploy": grant.get("expires") or ""})
-        self.log(f"{ws.name}: deploy window open until {grant.get('expires')} ({', '.join(values) or 'token only'})")
+        self.log(f"{ws.name}: deploy window open until {grant.get('expires')} ({', '.join([*values, *files]) or 'token only'})")
 
     def sweep(self) -> list[str]:
         """Make every running workspace's certificate and deploy window match
@@ -1325,7 +1337,16 @@ class Manager:
             return
         dst = f"{cfg.secrets_path()}/{ENV_FILE}"
         try:
-            self.inc.file_push(self.secrets.env_file(), ws.instance, dst, uid=cfg.uid, gid=cfg.gid, mode="0600")
+            if os.path.exists(self.secrets.env_file()):
+                self.inc.file_push(self.secrets.env_file(), ws.instance, dst, uid=cfg.uid, gid=cfg.gid, mode="0600")
+            for name in self.secrets.cached_files():
+                self.inc.file_push(
+                    os.path.join(self.secrets.files_dir(), name), ws.instance,
+                    f"{cfg.secrets_files_path()}/{name}", uid=cfg.uid, gid=cfg.gid, mode="0600",
+                )
+            if self.secrets.cached_files():
+                self.inc.exec(ws.instance, "chown", f"{cfg.uid}:{cfg.gid}", cfg.secrets_files_path(), check=False)
+                self.inc.exec(ws.instance, "chmod", "0700", cfg.secrets_files_path(), check=False)
             self.inc.exec(ws.instance, "chown", f"{cfg.uid}:{cfg.gid}", cfg.secrets_path(), check=False)
             self.inc.exec(ws.instance, "chmod", "0700", cfg.secrets_path(), check=False)
         except IncusError as e:

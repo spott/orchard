@@ -12,6 +12,7 @@ secrets, and the file is gone after a restart until `dev` starts it again."""
 from __future__ import annotations
 
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -23,6 +24,8 @@ from . import OrchardError
 from .config import Config
 
 ENV_FILE = "env"
+FILES_DIR = "files"
+FILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 class SecretsError(OrchardError):
@@ -36,7 +39,16 @@ class Secrets:
 
     @property
     def configured(self) -> bool:
-        return bool(self.cfg.secrets_env)
+        return bool(self.cfg.secrets_env or self.cfg.secrets_files)
+
+    def files_dir(self) -> str:
+        return os.path.join(self.cfg.secrets_cache, FILES_DIR)
+
+    def cached_files(self) -> list[str]:
+        try:
+            return sorted(f for f in os.listdir(self.files_dir()) if not f.startswith("."))
+        except OSError:
+            return []
 
     def env_file(self) -> str:
         return os.path.join(self.cfg.secrets_cache, ENV_FILE)
@@ -77,7 +89,25 @@ class Secrets:
         values: dict[str, str] = {}
         for key, ref in sorted(self.cfg.secrets_env.items()):
             values[key] = self.read(ref)
+        files: dict[str, str] = {}
+        for name, ref in sorted(self.cfg.secrets_files.items()):
+            if not FILE_NAME_RE.fullmatch(name):
+                raise SecretsError(f"secrets file name {name!r}: letters, digits, dot, dash, underscore only")
+            files[name] = self.read(ref)
         os.makedirs(self.cfg.secrets_cache, exist_ok=True)
+        os.makedirs(self.files_dir(), mode=0o700, exist_ok=True)
+        for name, content in files.items():
+            fd, tmp = tempfile.mkstemp(dir=self.files_dir(), prefix=".new-")
+            try:
+                os.fchmod(fd, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(content)
+                os.replace(tmp, os.path.join(self.files_dir(), name))
+            except BaseException:
+                os.unlink(tmp)
+                raise
+        for stale in set(self.cached_files()) - set(files):
+            os.unlink(os.path.join(self.files_dir(), stale))
         fd, tmp = tempfile.mkstemp(dir=self.cfg.secrets_cache, prefix=".env-")
         try:
             os.fchmod(fd, 0o640)
@@ -89,5 +119,5 @@ class Secrets:
         except BaseException:
             os.unlink(tmp)
             raise
-        self.log(f"secrets cache refreshed: {', '.join(values)}")
-        return list(values)
+        self.log(f"secrets cache refreshed: {', '.join([*values, *files])}")
+        return [*values, *files]
