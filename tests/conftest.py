@@ -5,6 +5,8 @@ import subprocess
 from datetime import datetime, timezone
 from typing import Any
 
+from datetime import timedelta
+
 import pytest
 
 from orchard import workspace
@@ -273,3 +275,41 @@ def keygen(monkeypatch):
 
     monkeypatch.setattr(workspace.subprocess, "run", fake)
     return calls
+
+
+class FakeK8sApi:
+    """Stands in for K8s.request: answers TokenRequests, records them."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict]] = []
+        self.status = 201
+        self.n = 0
+
+    def __call__(self, path, body):
+        self.calls.append((path, body))
+        if self.status != 201:
+            return self.status, {"message": "forbidden"}
+        self.n += 1
+        exp = FROZEN + timedelta(seconds=body["spec"]["expirationSeconds"])
+        return 201, {"status": {"token": f"TOKEN-{self.n}", "expirationTimestamp": exp.strftime("%Y-%m-%dT%H:%M:%SZ")}}
+
+
+@pytest.fixture
+def k8s_api(cfg, tmp_path, mgr):
+    """A host with k8s roles configured (0.8); returns the fake API."""
+    from orchard.k8s import K8s
+
+    ca = tmp_path / "k8s-ca.crt"
+    ca.write_text("FAKE CA\n")
+    cfg.k8s_server = "https://k3s.example:6443"
+    cfg.k8s_ca_file = str(ca)
+    cfg.k8s_token_file = str(tmp_path / "minter")
+    cfg.k8s_roles = {
+        "mcp": {"namespace": "mcp", "serviceAccount": "orchard-view"},
+        "cluster-view": {"namespace": "orchard-access", "serviceAccount": "cluster-view"},
+    }
+    cfg.state_dir = str(tmp_path / "state")
+    api = FakeK8sApi()
+    mgr.k8s = K8s(cfg, log=mgr.log, now=lambda: FROZEN.timestamp())
+    mgr.k8s.request = api
+    return api

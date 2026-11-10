@@ -61,6 +61,17 @@ class Config:
     # grants and pushes key + certificate into its tmpfs. Empty = off.
     ssh_ca_key_file: str = ""
     ssh_cert_minutes: int = 60
+    # Kubernetes: `k8s:<role>` grants. A role is a ServiceAccount in a
+    # namespace ({"namespace": ..., "serviceAccount": ...}); k8s_token_file
+    # holds a token that may only create tokens for those accounts, and
+    # `dev token k8s <role>` hands a workspace a short-lived one. The
+    # workspace's kubeconfig (<secrets_path>/kubeconfig, one context per
+    # granted role) calls that as a credential plugin. Empty server = off.
+    k8s_server: str = ""
+    k8s_ca_file: str = ""
+    k8s_token_file: str = ""
+    k8s_roles: dict[str, dict[str, str]] = field(default_factory=dict)
+    k8s_token_minutes: int = 60
     # Deploy window. While a workspace holds an active `ssh` grant for
     # deploy_principal (which must carry an expiry of at most
     # deploy_max_hours), the host reads deploy_env (env var -> op://
@@ -147,6 +158,16 @@ class Config:
 
     def ssh_ca_enabled(self) -> bool:
         return bool(self.ssh_ca_key_file)
+
+    def k8s_enabled(self) -> bool:
+        return bool(self.k8s_server and self.k8s_ca_file and self.k8s_token_file)
+
+    def kubeconfig_path(self) -> str:
+        return f"{self.secrets_path()}/kubeconfig"
+
+    def client_path(self) -> str:
+        """The self-service `dev` client inside a workspace."""
+        return f"/home/{self.user}/.local/bin/dev"
 
     def deploy_enabled(self) -> bool:
         return bool(self.ssh_ca_key_file and self.deploy_token_file)

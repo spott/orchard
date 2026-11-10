@@ -184,7 +184,16 @@ def cmd_revoke(mgr: Manager, args: argparse.Namespace) -> int:
 
 
 def cmd_token(mgr: Manager, args: argparse.Namespace) -> int:
-    tok = mgr.token(args.name, args.kind)
+    if args.role and args.kind != "k8s":
+        raise OrchardError(f"dev token {args.kind} takes no role")
+    tok = mgr.token(args.name, args.kind, args.role)
+    if args.kind == "k8s" and args.exec_:
+        # kubectl credential plugin protocol.
+        print(json.dumps({
+            "apiVersion": "client.authentication.k8s.io/v1", "kind": "ExecCredential",
+            "status": {"token": tok["token"], "expirationTimestamp": tok["expires_at"]},
+        }))
+        return 0
     if args.kind == "ssh":
         _emit(args, tok, f"{tok['workspace']}: certificate for {', '.join(tok['principals'])} until {tok['expires']} at {tok['certificate']}")
         return 0
@@ -276,9 +285,9 @@ def build_parser() -> argparse.ArgumentParser:
     u = add("update", cmd_update, "re-lock project flakes under ~/work to the image's nixpkgs")
     u.add_argument("names", nargs="*", help="workspaces (default: every running one)")
     add("proxy", cmd_proxy, "front-door path: ensure running, then relay stdio to its sshd").add_argument("host")
-    gr = add("grant", cmd_grant, "let a workspace reach something (github: a repository; ssh: a principal); tokens follow on the next mint")
+    gr = add("grant", cmd_grant, "let a workspace reach something (github: a repository; ssh: a principal; k8s: a role); tokens follow on the next mint")
     gr.add_argument("name")
-    gr.add_argument("value", help="github: owner/repo, or repo under the configured owner; ssh: a principal such as ro, printers, deploy. `ssh:printers` / `github:iac` name the kind in the value")
+    gr.add_argument("value", help="github: owner/repo, or repo under the configured owner; ssh: a principal such as ro, printers, deploy; k8s: a role from the host's catalog. `ssh:printers` / `k8s:mcp` / `github:iac` name the kind in the value")
     gr.add_argument("--kind", default="github", choices=sorted(GRANT_KINDS))
     gr.add_argument("--for", dest="for_", metavar="DURATION", help="expire after 30m, 2h, 3d, or at an ISO timestamp")
     gr.add_argument("--permissions", help="narrow the token: contents=read,pull_requests=write,...")
@@ -287,8 +296,10 @@ def build_parser() -> argparse.ArgumentParser:
     rv.add_argument("value", help="as for grant; `ssh:printers` names the kind in the value")
     rv.add_argument("--kind", default="github", choices=sorted(GRANT_KINDS))
     t = add("token", cmd_token, "mint (or reuse) a short-lived token limited to the workspace's grants")
-    t.add_argument("kind", choices=["github", "ssh"])
+    t.add_argument("kind", choices=["github", "ssh", "k8s"])
     t.add_argument("name")
+    t.add_argument("role", nargs="?", help="k8s: which granted role (optional when the workspace has one)")
+    t.add_argument("--exec", dest="exec_", action="store_true", help="k8s: print a kubectl ExecCredential")
     t.add_argument("--git", action="store_true", help="print it in git credential-helper form")
     add("sweep", cmd_sweep, "re-mint narrower certificates and close lapsed deploy windows as grants expire (a timer)")
     sc = add("secrets", cmd_secrets, "the secrets every workspace gets at start: refresh the cache, push, list")
@@ -326,10 +337,13 @@ def self_argv(argv: list[str], self_name: str) -> list[str]:
         elif len(rest) == 2 and rest[0] != self_name:
             raise SelfRefused(f"a workspace may only rename itself ({self_name})")
     elif verb == "token":
-        # `dev token github` -> `dev token github <self>`
+        # `dev token github` -> `dev token github <self>`;
+        # `dev token k8s [role]` -> `dev token k8s <self> [role]`
         if len(rest) == 1:
             rest = [rest[0], self_name]
-        elif len(rest) == 2 and rest[1] != self_name:
+        elif rest[0] == "k8s" and len(rest) == 2 and rest[1] != self_name:
+            rest = [rest[0], self_name, rest[1]]
+        elif len(rest) >= 2 and rest[1] != self_name:
             raise SelfRefused(f"a workspace may only mint tokens for itself ({self_name})")
     else:
         if not rest:
