@@ -35,7 +35,10 @@ def dmgr(dep_cfg, inc, logs, clock) -> Manager:
 
 
 def _rm_calls(inc):
-    return [c[2] for c in inc.calls if c[0] == "exec" and c[2][:2] == ("rm", "-f")]
+    return [c[2] for c in inc.calls if c[0] == "exec" and c[2][0] == "rm"]
+
+
+CLOSE = ("rm", "-rf", "/run/user/1000/orchard/deploy.env", "/run/user/1000/orchard/deploy")
 
 
 def test_deploy_grant_is_time_boxed(dmgr, inc, keygen):
@@ -64,7 +67,7 @@ def test_deploy_window_opens_and_closes_with_the_grant(dmgr, inc, keygen, logs):
 
     inc.calls.clear()
     ws = dmgr.revoke("iac", "ssh", "deploy")
-    assert ("rm", "-f", "/run/user/1000/orchard/deploy.env") in _rm_calls(inc)
+    assert CLOSE in _rm_calls(inc)
     assert ws.deploy is None and ws.ssh_principals is None and ws.grants == []
 
 
@@ -81,7 +84,7 @@ def test_sweep_closes_a_lapsed_window_and_narrows_the_certificate(dmgr, inc, key
     assert dmgr.sweep() == ["iac"]
     ws = dmgr.require("iac")
     assert ws.ssh_principals == "ro" and ws.deploy is None
-    assert ("rm", "-f", "/run/user/1000/orchard/deploy.env") in _rm_calls(inc)
+    assert CLOSE in _rm_calls(inc)
     sign = [a for a in keygen if "-s" in a][-1]
     assert sign[sign.index("-n") + 1] == "ro"
     # Expired grants remain listed (dev ls marks them) but confer nothing.
@@ -128,3 +131,38 @@ def test_sweep_copes_with_a_certificate_minted_before_principals_were_recorded(d
     assert dmgr.require("old").ssh_principals == "printers"
     # And a second sweep is a no-op.
     assert dmgr.sweep() == []
+
+
+def test_deploy_files_come_and_go_with_the_window(dmgr, dep_cfg, inc, keygen, tmp_path):
+    op = tmp_path / "op"
+    op.write_text('#!/bin/sh\ncase "$*" in *pve/password*) printf pw-secret ;; *nixbuild*) printf "PRIVATE KEY\\n" ;; *) exit 1 ;; esac\n')
+    dep_cfg.deploy_files = {"nixbuild-key": "op://homelab/nixbuild key/private key"}
+    dmgr.create("iac")
+    dmgr.grant("iac", "ssh", "deploy", expires=(FROZEN + timedelta(hours=1)).isoformat())
+    pushes = {c[2]: (c[3], c[4], c[5]) for c in inc.calls if c[0] == "file_push"}
+    assert pushes["/run/user/1000/orchard/deploy/nixbuild-key"] == (1000, 100, "0600")
+    assert inc.files["iac"]["/run/user/1000/orchard/deploy/nixbuild-key"] == "PRIVATE KEY\n"
+    inc.calls.clear()
+    dmgr.revoke("iac", "ssh", "deploy")
+    assert CLOSE in _rm_calls(inc)
+
+
+def test_secrets_files_are_cached_and_pushed_at_start(dep_cfg, inc, logs, tmp_path, keygen):
+    from orchard.workspace import Manager
+
+    op = tmp_path / "op"
+    op.write_text('#!/bin/sh\ncase "$*" in *claude*) printf tok ;; *hostkey*) printf "HOSTKEY\\n" ;; *) exit 1 ;; esac\n')
+    tok = tmp_path / "token"
+    tok.write_text("T\n")
+    dep_cfg.secrets_token_file = str(tok)
+    dep_cfg.secrets_cache = str(tmp_path / "cache")
+    dep_cfg.secrets_env = {"CLAUDE": "op://dev/claude/credential"}
+    dep_cfg.secrets_files = {"known_hosts": "op://dev/hostkey/notes"}
+    m = Manager(dep_cfg, inc, log=logs.append, probe=lambda ip, port: True, sleep=lambda s: None, now=lambda: FROZEN)
+    assert m.secrets.refresh() == ["CLAUDE", "known_hosts"]
+    assert m.secrets.cached_files() == ["known_hosts"]
+    m.create("foo")
+    pushes = {c[2]: (c[3], c[4], c[5]) for c in inc.calls if c[0] == "file_push"}
+    assert pushes["/run/user/1000/orchard/files/known_hosts"] == (1000, 100, "0600")
+    assert inc.files["foo"]["/run/user/1000/orchard/files/known_hosts"] == "HOSTKEY\n"
+    assert "CLAUDE=tok" in inc.files["foo"]["/run/user/1000/orchard/env"]

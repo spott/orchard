@@ -71,6 +71,9 @@ class Config:
     # (`dev sweep`, a timer). Empty token file = off.
     deploy_token_file: str = ""
     deploy_env: dict[str, str] = field(default_factory=dict)
+    # Files the window carries (an ssh key for a remote builder, say):
+    # name -> op:// reference, pushed to <secrets_path>/deploy/<name>, mode 0600.
+    deploy_files: dict[str, str] = field(default_factory=dict)
     deploy_principal: str = "deploy"
     deploy_max_hours: int = 4
     # The wake resolver (`orchard-dns`): a lookup of `<name>.<zone>` starts
@@ -102,6 +105,9 @@ class Config:
     # variable -> `op://` reference, read with the 1Password service account
     # token in secrets_token_file, cached under secrets_cache.
     secrets_env: dict[str, str] = field(default_factory=dict)
+    # Files every workspace gets alongside the env: name -> op:// reference,
+    # cached under secrets_cache/files and pushed to <secrets_path>/files/<name>.
+    secrets_files: dict[str, str] = field(default_factory=dict)
     secrets_token_file: str = ""
     secrets_cache: str = "/run/orchard/secrets"
     op: str = "op"
@@ -144,6 +150,12 @@ class Config:
 
     def deploy_enabled(self) -> bool:
         return bool(self.ssh_ca_key_file and self.deploy_token_file)
+
+    def secrets_files_path(self) -> str:
+        return f"{self.secrets_path()}/files"
+
+    def deploy_files_path(self) -> str:
+        return f"{self.secrets_path()}/deploy"
 
     def ssh_cert_dir(self) -> str:
         """Where a workspace's ssh certificate lands: next to the secrets env."""

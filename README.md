@@ -168,7 +168,8 @@ dev revoke iac ssh:deploy            # close it now; `dev sweep` (timer) closes 
 ```
 
 `deploy.env` holds `OP_SERVICE_ACCOUNT_TOKEN` (the deploy account, read-only
-on the vault deploys need) and the configured `env` values, so an unchanged
+on the vault deploys need) and the configured `env` values; `deploy.files`
+land next to it under `deploy/` (an ssh key for a remote builder, say), so an unchanged
 `nix run .#switchOne.<node>` works from inside; the image's shell sources it
 like the secrets env. While the window is open the workspace is as powerful
 as the operator — that is the point of the time box. `dev sweep` also
