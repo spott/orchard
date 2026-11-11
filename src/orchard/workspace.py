@@ -39,6 +39,7 @@ GRANT_KINDS = {"github", "ssh", "k8s"}
 # An ssh certificate principal (the role a grant conveys: ro, printers, deploy).
 PRINCIPAL_RE = re.compile(r"[a-z][a-z0-9-]{0,31}")
 SSH_KEY_NAME = "id_ed25519"
+SSH_NEW_SUFFIX = ".new"  # a mint pushes under this, then moves both files into place
 DEPLOY_ENV_FILE = "deploy.env"
 # How long `dev` waits for the workspace user's runtime tmpfs (/run/user/<uid>,
 # made by logind for the lingering user) before pushing secrets into it.
@@ -1111,7 +1112,11 @@ class Manager:
         """A fresh (or cached, unexpired) token for the workspace, limited to
         its active grants of that kind. `role` picks among k8s grants."""
         if kind == "ssh":
-            return self._mint_ssh(self.require(name))
+            # Every mint makes a new key pair, so two at once could leave one
+            # mint's key beside the other's certificate (0.8.1). The lock makes
+            # them take turns; the last one leaves a matching pair.
+            with locks.held(self.cfg.lock_dir, name):
+                return self._mint_ssh(self.require(name))
         if kind == "k8s":
             return self._mint_k8s(self.require(name), role)
         if kind != "github":
@@ -1204,7 +1209,9 @@ class Manager:
         and push key + certificate into its runtime tmpfs. The private key is
         generated on the host, pushed once, and deleted here: it only ever
         speaks for this workspace, for `ssh_cert_minutes`. The identity
-        `ws:<name>` is what sshd on the target logs."""
+        `ws:<name>` is what sshd on the target logs.
+
+        The caller holds the workspace lock: mints must not overlap."""
         cfg = self.cfg
         if not cfg.ssh_ca_enabled():
             raise OrchardError("ssh certificates are not configured on this host (services.orchard.sshCA)")
@@ -1227,8 +1234,16 @@ class Manager:
             ])
             cert = key + "-cert.pub"
             dst_dir = cfg.ssh_cert_dir()
-            self.inc.file_push(key, ws.instance, f"{dst_dir}/{SSH_KEY_NAME}", uid=cfg.uid, gid=cfg.gid, mode="0600")
-            self.inc.file_push(cert, ws.instance, f"{dst_dir}/{SSH_KEY_NAME}-cert.pub", uid=cfg.uid, gid=cfg.gid, mode="0644")
+            dst_key, dst_cert = f"{dst_dir}/{SSH_KEY_NAME}", f"{dst_dir}/{SSH_KEY_NAME}-cert.pub"
+            # Two pushes are two round trips; an ssh starting between them
+            # would read a new key with the old certificate. Push under other
+            # names, then swap both in with one command inside the instance.
+            self.inc.file_push(key, ws.instance, dst_key + SSH_NEW_SUFFIX, uid=cfg.uid, gid=cfg.gid, mode="0600")
+            self.inc.file_push(cert, ws.instance, dst_cert + SSH_NEW_SUFFIX, uid=cfg.uid, gid=cfg.gid, mode="0644")
+            self.inc.exec(
+                ws.instance, "sh", "-c", 'mv -f "$1" "$2" && mv -f "$3" "$4"', "sh",
+                dst_key + SSH_NEW_SUFFIX, dst_key, dst_cert + SSH_NEW_SUFFIX, dst_cert,
+            )
             self.inc.exec(ws.instance, "chown", f"{cfg.uid}:{cfg.gid}", cfg.secrets_path(), dst_dir, check=False)
             self.inc.exec(ws.instance, "chmod", "0700", cfg.secrets_path(), dst_dir, check=False)
         finally:
@@ -1263,6 +1278,10 @@ class Manager:
             return
         d = self.cfg.ssh_cert_dir()
         self.inc.exec(ws.instance, "rm", "-f", f"{d}/{SSH_KEY_NAME}", f"{d}/{SSH_KEY_NAME}-cert.pub", check=False)
+        self.inc.exec(
+            ws.instance, "rm", "-f", f"{d}/{SSH_KEY_NAME}{SSH_NEW_SUFFIX}", f"{d}/{SSH_KEY_NAME}-cert.pub{SSH_NEW_SUFFIX}",
+            check=False,
+        )
         if ws.ssh_principals is not None:
             # Incus refuses to unset a key that is not set (a certificate
             # minted before 0.6 has none recorded).
@@ -1337,22 +1356,28 @@ class Manager:
         narrower certificate, or none) and a lapsed deploy window loses its
         env file. A timer runs this every few minutes."""
         touched: list[str] = []
-        for ws in self.list():
-            if not ws.running:
+        for listed in self.list():
+            if not listed.running:
                 continue
-            want = self._ssh_principals(ws)
-            have = [p for p in (ws.ssh_principals or "").split(",") if p]
-            if self.cfg.ssh_ca_enabled() and have != want:
-                self._drop_ssh_cert(ws)
-                self._push_ssh_cert(ws)
-                touched.append(ws.name)
-            if self.k8s is not None and [r for r in (ws.k8s_roles or "").split(",") if r] != self._k8s_roles(ws):
-                self._push_kubeconfig(ws)
-                touched.append(ws.name)
-            before = ws.deploy
-            self._push_deploy(ws)
-            if self.require(ws.name).deploy != before and ws.name not in touched:
-                touched.append(ws.name)
+            # Under the workspace lock, and re-read inside it: a renewal from
+            # inside the workspace or a grant may be running right now.
+            with locks.held(self.cfg.lock_dir, listed.name):
+                ws = self.get(listed.name)
+                if ws is None or not ws.running:
+                    continue
+                want = self._ssh_principals(ws)
+                have = [p for p in (ws.ssh_principals or "").split(",") if p]
+                if self.cfg.ssh_ca_enabled() and have != want:
+                    self._drop_ssh_cert(ws)
+                    self._push_ssh_cert(ws)
+                    touched.append(ws.name)
+                if self.k8s is not None and [r for r in (ws.k8s_roles or "").split(",") if r] != self._k8s_roles(ws):
+                    self._push_kubeconfig(ws)
+                    touched.append(ws.name)
+                before = ws.deploy
+                self._push_deploy(ws)
+                if self.require(ws.name).deploy != before and ws.name not in touched:
+                    touched.append(ws.name)
         return touched
 
     def _revoke_tokens(self, name: str) -> None:

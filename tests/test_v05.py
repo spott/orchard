@@ -28,9 +28,10 @@ def test_ssh_grant_mints_a_certificate_into_the_tmpfs(mgr, ca_cfg, inc, keygen):
     assert sign[sign.index("-I") + 1] == "ws:foo"
     assert sign[sign.index("-n") + 1] == "printers,ro"
     assert sign[sign.index("-V") + 1] == "+60m"
+    # Pushed under temporary names, then moved into place together (0.8.1).
     pushes = _pushes(inc)
-    assert pushes["/run/user/1000/orchard/ssh/id_ed25519"] == (1000, 100, "0600")
-    assert pushes["/run/user/1000/orchard/ssh/id_ed25519-cert.pub"] == (1000, 100, "0644")
+    assert pushes["/run/user/1000/orchard/ssh/id_ed25519.new"] == (1000, 100, "0600")
+    assert pushes["/run/user/1000/orchard/ssh/id_ed25519-cert.pub.new"] == (1000, 100, "0644")
     assert inc.files["foo"]["/run/user/1000/orchard/ssh/id_ed25519-cert.pub"].endswith("printers,ro\n")
     assert inc.files["foo"]["/run/user/1000/orchard/ssh/id_ed25519"] == "PRIVATE\n"
     # Nothing of the key pair stays on the host.
@@ -70,7 +71,7 @@ def test_start_pushes_a_certificate_and_revoke_drops_it(mgr, ca_cfg, inc, keygen
     keygen.clear()
     mgr.start("foo")
     assert any("-s" in a for a in keygen), "start re-mints for the active grants"
-    assert "/run/user/1000/orchard/ssh/id_ed25519-cert.pub" in _pushes(inc)
+    assert "/run/user/1000/orchard/ssh/id_ed25519-cert.pub.new" in _pushes(inc)
 
     inc.calls.clear()
     keygen.clear()
