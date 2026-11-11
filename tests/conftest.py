@@ -152,6 +152,12 @@ class FakeIncus(Incus):
         rc, out, err = self.exec_out.get(name, (0, "", ""))
         if check and rc != 0:
             raise IncusError([self.binary, "exec", name, *cmd], rc, err)
+        if rc == 0 and len(cmd) > 3 and cmd[:2] == ("sh", "-c") and cmd[2].startswith("mv -f"):
+            # `sh -c 'mv -f "$1" "$2" && …' sh src dst [src dst …]`: one step.
+            files = self.files.setdefault(name, {})
+            args = cmd[4:]
+            for src, dst in zip(args[::2], args[1::2]):
+                files[dst] = files.pop(src)
         return subprocess.CompletedProcess([self.binary, "exec", name, *cmd], rc, out, err)
 
     def file_push(self, src, name, dst, *, uid=None, gid=None, mode=None):
