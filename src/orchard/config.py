@@ -61,8 +61,13 @@ class Config:
     # grants and pushes key + certificate into its tmpfs. Empty = off.
     ssh_ca_key_file: str = ""
     ssh_cert_minutes: int = 60
+    # What the principals mean, for `dev --help` (principal -> one line).
+    # Descriptive only: which principals a host accepts is that host's
+    # AuthorizedPrincipalsFile, and `dev grant` takes any name.
+    ssh_principals: dict[str, str] = field(default_factory=dict)
     # Kubernetes: `k8s:<role>` grants. A role is a ServiceAccount in a
-    # namespace ({"namespace": ..., "serviceAccount": ...}); k8s_token_file
+    # namespace ({"namespace": ..., "serviceAccount": ..., and optionally
+    # "description": a line for `dev --help`}); k8s_token_file
     # holds a token that may only create tokens for those accounts, and
     # `dev token k8s <role>` hands a workspace a short-lived one. The
     # workspace's kubeconfig (<secrets_path>/kubeconfig, one context per

@@ -162,6 +162,10 @@ it can do is that account's RBAC in the cluster, which orchard does not
 manage. The host holds a **minter** token whose only right is creating
 tokens for those accounts.
 
+`dev --help` (and `dev grant --help`) lists every grant this host can give
+and what it means: the k8s roles with their `description`, and the ssh
+principals described in `sshCA.principals`.
+
 ```
 dev grant blah.mcps k8s:mcp          # a context `mcp` appears in the workspace's kubeconfig
 dev grant iac k8s:cluster-view --for 8h

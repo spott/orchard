@@ -237,8 +237,50 @@ def cmd_secrets(mgr: Manager, args: argparse.Namespace) -> int:
     return 0
 
 
-def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="dev", description="Orchard workspaces on Incus.")
+def grants_help(cfg: Config | None) -> str:
+    """The grant catalog for `dev --help` and `dev grant --help`: every
+    value `dev grant NAME <kind>:<value>` takes on this host and what it
+    lets the workspace do. Without a readable config, the kinds alone."""
+    if cfg is None:
+        return ("grants (dev grant NAME <kind>:<value> [--for 2h]):\n"
+                "  github:<repo>      a repository\n"
+                "  ssh:<principal>    an ssh certificate principal\n"
+                "  k8s:<role>         a Kubernetes role\n")
+    rows: list[tuple[str, str]] = []
+    if cfg.github_enabled():
+        perms = ", ".join(f"{k}={v}" for k, v in sorted(cfg.github_default_permissions.items())) or "the App's full set"
+        rows.append(("github:<repo>", f"a repository under {cfg.github_owner} (or owner/repo): {perms}; --permissions narrows it"))
+    else:
+        rows.append(("github:<repo>", "off on this host (no GitHub App configured)"))
+    if cfg.ssh_ca_enabled():
+        names = dict(cfg.ssh_principals)
+        if cfg.deploy_enabled():
+            window = f"opens the deploy window; needs --for, at most {cfg.deploy_max_hours}h"
+            mine = names.get(cfg.deploy_principal, "")
+            names[cfg.deploy_principal] = f"{mine}; {window}" if mine else window
+        for name in sorted(names):
+            rows.append((f"ssh:{name}", names[name]))
+        rows.append(("ssh:<principal>", f"any other principal the hosts accept; certificates last {cfg.ssh_cert_minutes} min"))
+    else:
+        rows.append(("ssh:<principal>", "off on this host (no ssh CA configured)"))
+    if cfg.k8s_enabled():
+        for name in sorted(cfg.k8s_roles):
+            role = cfg.k8s_roles[name]
+            what = role.get("description") or f"ServiceAccount {role.get('serviceAccount', '?')}"
+            rows.append((f"k8s:{name}", f"{what} (namespace {role.get('namespace', '?')})"))
+        if not cfg.k8s_roles:
+            rows.append(("k8s:<role>", "no roles in this host's catalog"))
+    else:
+        rows.append(("k8s:<role>", "off on this host (no cluster configured)"))
+    width = max(len(k) for k, _ in rows)
+    lines = ["grants (dev grant NAME <kind>:<value> [--for 2h]; dev revoke takes the same; dev ls shows what a workspace holds):"]
+    lines += [f"  {k.ljust(width)}  {v}" for k, v in rows]
+    return "\n".join(lines) + "\n"
+
+
+def build_parser(cfg: Config | None = None) -> argparse.ArgumentParser:
+    raw = argparse.RawDescriptionHelpFormatter
+    p = argparse.ArgumentParser(prog="dev", description="Orchard workspaces on Incus.", epilog=grants_help(cfg), formatter_class=raw)
     p.add_argument("--json", action="store_true", help="machine-readable output")
     p.add_argument("--version", action="version", version=f"orchard {__version__}")
     sub = p.add_subparsers(dest="cmd", required=True, metavar="VERB")
@@ -286,6 +328,7 @@ def build_parser() -> argparse.ArgumentParser:
     u.add_argument("names", nargs="*", help="workspaces (default: every running one)")
     add("proxy", cmd_proxy, "front-door path: ensure running, then relay stdio to its sshd").add_argument("host")
     gr = add("grant", cmd_grant, "let a workspace reach something (github: a repository; ssh: a principal; k8s: a role); tokens follow on the next mint")
+    gr.epilog, gr.formatter_class = grants_help(cfg), raw
     gr.add_argument("name")
     gr.add_argument("value", help="github: owner/repo, or repo under the configured owner; ssh: a principal such as ro, printers, deploy; k8s: a role from the host's catalog. `ssh:printers` / `k8s:mcp` / `github:iac` name the kind in the value")
     gr.add_argument("--kind", default="github", choices=sorted(GRANT_KINDS))
@@ -371,7 +414,11 @@ def detach() -> bool:
 
 
 def main(argv: list[str] | None = None, self_name: str | None = None) -> int:
-    parser = build_parser()
+    try:
+        help_cfg: Config | None = Config.load()
+    except OrchardError:
+        help_cfg = None  # the verb reports it below; --help still works
+    parser = build_parser(help_cfg)
     try:
         if self_name is not None:
             argv = self_argv(list(argv or []), self_name)

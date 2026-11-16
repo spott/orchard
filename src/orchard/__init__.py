@@ -1,6 +1,6 @@
 """Orchard: per-workspace dev containers on Incus, behind one ssh front door."""
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 
 
 class OrchardError(Exception):
