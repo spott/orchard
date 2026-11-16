@@ -43,6 +43,7 @@ let
     openssl = "${pkgs.openssl}/bin/openssl";
     ssh_ca_key_file = if cfg.sshCA.enable then cfg.sshCA.privateKeyFile else "";
     ssh_cert_minutes = cfg.sshCA.certificateMinutes;
+    ssh_principals = cfg.sshCA.principals;
     k8s_server = if cfg.k8s.enable then cfg.k8s.server else "";
     k8s_ca_file = if cfg.k8s.enable then "${cfg.k8s.caFile}" else "";
     k8s_token_file = if cfg.k8s.enable then cfg.k8s.tokenFile else "";
@@ -218,6 +219,12 @@ in
         default = 60;
         description = "Validity of each certificate; the image re-mints on use when it has lapsed.";
       };
+      principals = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = { ro = "read-only login on every host"; };
+        description = "What each principal means, one line each, listed by `dev --help`. Descriptive only: `dev grant` takes any principal, and which ones a host accepts is that host's `AuthorizedPrincipalsFile`.";
+      };
     };
 
     k8s = {
@@ -251,6 +258,7 @@ in
           options = {
             namespace = lib.mkOption { type = lib.types.str; description = "Namespace of the ServiceAccount; also the context's default namespace."; };
             serviceAccount = lib.mkOption { type = lib.types.str; description = "The ServiceAccount whose tokens this role hands out."; };
+            description = lib.mkOption { type = lib.types.str; default = ""; description = "What the role may do, one line, listed by `dev --help`."; };
           };
         });
         default = { };
