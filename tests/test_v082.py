@@ -49,6 +49,8 @@ def test_help_carries_the_catalog(capsys):
 # -- 0.8.3: `dev grants`, also from inside a workspace -----------------------
 
 def test_grants_verb_shows_holdings_and_the_command_to_ask_for(mgr, capsys):
+    mgr.cfg.k8s_server, mgr.cfg.k8s_ca_file, mgr.cfg.k8s_token_file = "https://k", "/ca.crt", "/tok"
+    mgr.cfg.k8s_roles = {"mcp": {"namespace": "mcp", "serviceAccount": "sa"}}
     mgr.create("foo")
     mgr.grant("foo", "ssh", "ro")
     args = cli.build_parser(mgr.cfg).parse_args(["grants", "foo"])
@@ -56,6 +58,7 @@ def test_grants_verb_shows_holdings_and_the_command_to_ask_for(mgr, capsys):
     out = capsys.readouterr().out
     assert "foo holds:" in out and "ssh:ro" in out and "standing" in out
     assert "dev grant foo <kind>:<value>" in out
+    assert out.count("dev grant foo ") == 2 and "dev grants foo shows" in out  # header too, with roles configured
     assert "cannot grant itself" in out
 
 
