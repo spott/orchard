@@ -259,12 +259,12 @@ def cmd_secrets(mgr: Manager, args: argparse.Namespace) -> int:
     return 0
 
 
-def grants_help(cfg: Config | None, name: str = "NAME") -> str:
+def grants_help(cfg: Config | None, workspace: str = "NAME") -> str:
     """The grant catalog for `dev --help` and `dev grant --help`: every
     value `dev grant NAME <kind>:<value>` takes on this host and what it
     lets the workspace do. Without a readable config, the kinds alone."""
     if cfg is None:
-        return (f"grants (dev grant {name} <kind>:<value> [--for 2h]):\n"
+        return (f"grants (dev grant {workspace} <kind>:<value> [--for 2h]):\n"
                 "  github:<repo>      a repository\n"
                 "  ssh:<principal>    an ssh certificate principal\n"
                 "  k8s:<role>         a Kubernetes role\n")
@@ -295,7 +295,7 @@ def grants_help(cfg: Config | None, name: str = "NAME") -> str:
     else:
         rows.append(("k8s:<role>", "off on this host (no cluster configured)"))
     width = max(len(k) for k, _ in rows)
-    lines = [f"grants (dev grant {name} <kind>:<value> [--for 2h]; dev revoke takes the same; dev grants {name} shows what it holds):"]
+    lines = [f"grants (dev grant {workspace} <kind>:<value> [--for 2h]; dev revoke takes the same; dev grants {workspace} shows what it holds):"]
     lines += [f"  {k.ljust(width)}  {v}" for k, v in rows]
     return "\n".join(lines) + "\n"
 
