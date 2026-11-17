@@ -44,3 +44,25 @@ def test_help_carries_the_catalog(capsys):
             pass
         out = capsys.readouterr().out
         assert "k8s:mcp" in out and "ssh:ro" in out
+
+
+# -- 0.8.3: `dev grants`, also from inside a workspace -----------------------
+
+def test_grants_verb_shows_holdings_and_the_command_to_ask_for(mgr, capsys):
+    mgr.create("foo")
+    mgr.grant("foo", "ssh", "ro")
+    args = cli.build_parser(mgr.cfg).parse_args(["grants", "foo"])
+    assert args.fn(mgr, args) == 0
+    out = capsys.readouterr().out
+    assert "foo holds:" in out and "ssh:ro" in out and "standing" in out
+    assert "dev grant foo <kind>:<value>" in out
+    assert "cannot grant itself" in out
+
+
+def test_grants_verb_is_self_service_and_only_for_itself():
+    import pytest
+    assert cli.self_argv(["grants"], "foo") == ["grants", "foo"]
+    with pytest.raises(cli.SelfRefused):
+        cli.self_argv(["grants", "bar"], "foo")
+    with pytest.raises(cli.SelfRefused):
+        cli.self_argv(["grant", "foo", "ssh:deploy"], "foo")
