@@ -162,6 +162,11 @@ it can do is that account's RBAC in the cluster, which orchard does not
 manage. The host holds a **minter** token whose only right is creating
 tokens for those accounts.
 
+`dev grants NAME` shows what a workspace holds and what it could be given;
+it also works from inside the workspace (`dev grants`), where granting does
+not: an agent that is refused somewhere can tell its operator which
+`dev grant` to run.
+
 `dev --help` (and `dev grant --help`) lists every grant this host can give
 and what it means: the k8s roles with their `description`, and the ssh
 principals described in `sshCA.principals`.

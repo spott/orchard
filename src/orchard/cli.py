@@ -176,6 +176,28 @@ def cmd_grant(mgr: Manager, args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_grants(mgr: Manager, args: argparse.Namespace) -> int:
+    """What a workspace holds and what it could be given. Read-only, and the
+    one grant verb a workspace may run on itself: an agent that is refused
+    somewhere looks here and tells its operator which `dev grant` to run."""
+    ws = mgr.require(args.name)
+    live = active_grants(ws.grants)
+    held = []
+    for g in ws.grants:
+        state = "expired" if g not in live else (f"until {g['expires']}" if g.get("expires") else "standing")
+        perms = g.get("permissions")
+        extra = "  " + ",".join(f"{k}={v}" for k, v in sorted(perms.items())) if perms else ""
+        held.append({"grant": f"{g.get('kind')}:{g['value']}", "state": state, "extra": extra})
+    width = max((len(h["grant"]) for h in held), default=0)
+    text = [f"{ws.name} holds:"] + [f"  {h['grant'].ljust(width)}  {h['state']}{h['extra']}" for h in held]
+    if not held:
+        text.append("  nothing")
+    text += ["", "A workspace cannot grant itself. The operator runs, on the orchard host:",
+             f"  dev grant {ws.name} <kind>:<value> [--for 2h]", "", grants_help(mgr.cfg, ws.name).rstrip("\n")]
+    _emit(args, {"workspace": ws.name, "grants": ws.grants, "active": live}, "\n".join(text))
+    return 0
+
+
 def cmd_revoke(mgr: Manager, args: argparse.Namespace) -> int:
     kind, value = _kind_value(args)
     ws = mgr.revoke(args.name, kind, value)
@@ -237,12 +259,12 @@ def cmd_secrets(mgr: Manager, args: argparse.Namespace) -> int:
     return 0
 
 
-def grants_help(cfg: Config | None) -> str:
+def grants_help(cfg: Config | None, name: str = "NAME") -> str:
     """The grant catalog for `dev --help` and `dev grant --help`: every
     value `dev grant NAME <kind>:<value>` takes on this host and what it
     lets the workspace do. Without a readable config, the kinds alone."""
     if cfg is None:
-        return ("grants (dev grant NAME <kind>:<value> [--for 2h]):\n"
+        return (f"grants (dev grant {name} <kind>:<value> [--for 2h]):\n"
                 "  github:<repo>      a repository\n"
                 "  ssh:<principal>    an ssh certificate principal\n"
                 "  k8s:<role>         a Kubernetes role\n")
@@ -273,7 +295,7 @@ def grants_help(cfg: Config | None) -> str:
     else:
         rows.append(("k8s:<role>", "off on this host (no cluster configured)"))
     width = max(len(k) for k, _ in rows)
-    lines = ["grants (dev grant NAME <kind>:<value> [--for 2h]; dev revoke takes the same; dev ls shows what a workspace holds):"]
+    lines = [f"grants (dev grant {name} <kind>:<value> [--for 2h]; dev revoke takes the same; dev grants {name} shows what it holds):"]
     lines += [f"  {k.ljust(width)}  {v}" for k, v in rows]
     return "\n".join(lines) + "\n"
 
@@ -334,6 +356,7 @@ def build_parser(cfg: Config | None = None) -> argparse.ArgumentParser:
     gr.add_argument("--kind", default="github", choices=sorted(GRANT_KINDS))
     gr.add_argument("--for", dest="for_", metavar="DURATION", help="expire after 30m, 2h, 3d, or at an ISO timestamp")
     gr.add_argument("--permissions", help="narrow the token: contents=read,pull_requests=write,...")
+    add("grants", cmd_grants, "what a workspace holds and what it could be granted (also from inside one)").add_argument("name")
     rv = add("revoke", cmd_revoke, "take a grant away and revoke the workspace's live tokens")
     rv.add_argument("name")
     rv.add_argument("value", help="as for grant; `ssh:printers` names the kind in the value")
@@ -352,7 +375,7 @@ def build_parser(cfg: Config | None = None) -> argparse.ArgumentParser:
 
 
 # What a workspace may do to itself through its self-service key.
-SELF_VERBS = {"ls", "status", "stop", "rename", "rm", "token"}
+SELF_VERBS = {"ls", "status", "grants", "stop", "rename", "rm", "token"}
 # ...and which of those end its own ssh session, so they run detached.
 SELF_DETACHED = {"stop", "rename", "rm"}
 

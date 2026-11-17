@@ -91,7 +91,7 @@ exit $status
 # It sshes to the host as the jump user with a per-workspace key; the host
 # recognises the key and lets it act on this workspace only.
 SELF_CLIENT = """#!/bin/sh
-# orchard: manage THIS workspace from inside it (rename, rm, stop, status, ls).
+# orchard: manage THIS workspace from inside it (rename, rm, stop, status, ls, grants).
 # Installed by the host; the key in ~/.orchard only speaks for this workspace.
 d="$HOME/.orchard"
 # -F /dev/null: the user's own ssh config must not apply (ControlPath,
